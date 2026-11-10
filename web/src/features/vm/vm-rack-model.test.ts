@@ -176,7 +176,7 @@ describe('vmWindows', () => {
     }
   })
 
-  it('shows an unprobed Fable window as null and a plan denial as a note', () => {
+  it('shows an unprobed Fable window as null and hides it without permission', () => {
     const unprobed = vmWindows(vm({ subscription_type: 'pro' }))
     expect(unprobed[2]).toMatchObject({ key: 'fable', pct: null, note: null })
     const denied = vmWindows(
@@ -185,7 +185,7 @@ describe('vmWindows', () => {
         fable: { status: 403, plan_denied: true },
       })
     )
-    expect(denied[2]).toMatchObject({ pct: null, note: '无 Fable 权限' })
+    expect(denied.map((w) => w.key)).toEqual(['5h', '7d'])
   })
 
   it('omits Fable on tokenless and GPT slots', () => {

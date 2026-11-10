@@ -109,14 +109,16 @@ export type FableRow =
  * GPT 槽、无凭证槽返回 null 不占位。
  *
  * 未探测时 `pct: null`，和 5H / 7D 一样画「—」，不画 0% 冒充还很空。
- * 「拒 / 满 / 无权限」这些态没有百分比，此时返回 `note` 走文案而不是画满格条——
+ * 套餐没带 Fable 权限的号返回 null 不占位。
+ * 「拒 / 满」这些态没有百分比，此时返回 `note` 走文案而不是画满格条——
  * 满格红条在一个 5h/7d 都是 0% 的号上会被误读成「烧满了」，
  * 而实际含义是「这个号根本用不了 Fable」。
  */
 export function fableRow(vm: Vm): FableRow | null {
   const tier = claudeTier(vm)
   if (tier.key === 'none' || tier.key === 'codex') return null
-  if (fablePlanDenied(vm.fable)) return { kind: 'note', text: '无 Fable 权限' }
+  // 没有 Fable 权限的号不占行：有则显示，没有就不显示。
+  if (fablePlanDenied(vm.fable)) return null
   const st = fableState(vm, tier.key)
   if (st.usedPct != null) return { kind: 'bar', pct: st.usedPct }
   if (st.tone.key === 'none') return { kind: 'bar', pct: null }
