@@ -111,16 +111,11 @@ export function inventedFableWindow(subject: FableSubject): boolean {
 /** Fable 已用比例（0-100 或 0-1，未归一化，交给 `pct()` 处理）。对齐 `fableUsedOf`。 */
 export function fableUsedOf(
   subject: FableSubject,
-  tierKey: string
+  _tierKey: string
 ): number | null {
   const fb = (subject.fable as Record<string, unknown> | undefined) || {}
-  if (
-    tierKey === 'pro' ||
-    fablePlanDenied(fb) ||
-    inventedFableWindow(subject)
-  ) {
-    return null
-  }
+  // Pro 也能用 Fable（1.4.061），订阅档不再参与判定；参数保留给调用方对齐签名。
+  if (fablePlanDenied(fb) || inventedFableWindow(subject)) return null
   if (subject.utilization_7d_oi != null)
     return Number(subject.utilization_7d_oi)
   if (fb.utilization != null) return Number(fb.utilization)
@@ -145,7 +140,6 @@ export function fableProbeLabel(
   tierKey: string
 ): string {
   const fb = subject.fable as Record<string, unknown> | undefined
-  if (tierKey === 'pro') return 'Pro 无 Fable'
   // 落盘 Max 但 Fable 被拒：套餐没带 Fable 权限，不是 Pro。
   if (fablePlanDenied(fb)) return '无 Fable 权限'
   if (!fb) return '未探测'
@@ -361,8 +355,7 @@ export function fableCardInfo(
     return { usedPct: pct(used), reset, bits, badgeText: '', badgeCls: 'ok' }
   }
   const txt = fableProbeLabel(subject, tierKey)
-  const pro =
-    tierKey === 'pro' || fablePlanDenied(fb) || inventedFableWindow(subject)
+  const pro = fablePlanDenied(fb) || inventedFableWindow(subject)
   const badgeCls: 'ok' | 'warn' | 'bad' | 'none' = !fb
     ? 'none'
     : pro || fb.banned

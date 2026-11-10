@@ -113,7 +113,9 @@ export function poolQuota(vms: Vm[]): {
     })
     const fb = vm.fable || {}
     const tier = claudeTier(vm)
-    if (tier.key !== 'max' || fablePlanDenied(fb) || fb.banned) continue
+    // Fable 不再要求 Max：Pro / 未识别档的 Claude 凭证同样计入 Fable 窗口。
+    if (tier.key === 'codex' || tier.key === 'none') continue
+    if (fablePlanDenied(fb) || fb.banned) continue
     const used = fableUsedOf(vm, tier.key)
     const weeklyFull = fableWeeklyFull(vm, tier.key)
     wf.push({

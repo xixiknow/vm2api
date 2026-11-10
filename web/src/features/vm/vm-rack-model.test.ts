@@ -162,20 +162,37 @@ describe('rackTotals', () => {
 })
 
 describe('vmWindows', () => {
-  it('adds Fable only on Max, after 5H and 7D', () => {
-    const max = vmWindows(
+  it('adds a Fable row for every Claude tier, after 5H and 7D', () => {
+    for (const subscription_type of ['max', 'pro', undefined]) {
+      const r = vmWindows(
+        vm({
+          subscription_type,
+          utilization_7d_oi: 0.3,
+          reset_7d_oi: '2099-01-01T00:00:00Z',
+        })
+      )
+      expect(r.map((w) => w.key)).toEqual(['5h', '7d', 'fable'])
+      expect(r[2].pct).toBe(30)
+    }
+  })
+
+  it('shows an unprobed Fable window as null and a plan denial as a note', () => {
+    const unprobed = vmWindows(vm({ subscription_type: 'pro' }))
+    expect(unprobed[2]).toMatchObject({ key: 'fable', pct: null, note: null })
+    const denied = vmWindows(
       vm({
         subscription_type: 'max',
-        usage_has_fable: true,
-        utilization_7d_oi: 0.3,
-        reset_7d_oi: '2099-01-01T00:00:00Z',
+        fable: { status: 403, plan_denied: true },
       })
     )
-    expect(max.map((w) => w.key)).toEqual(['5h', '7d', 'fable'])
-    expect(max[2].pct).toBe(30)
-    expect(vmWindows(vm({ usage_has_fable: false })).map((w) => w.key)).toEqual(
-      ['5h', '7d']
-    )
+    expect(denied[2]).toMatchObject({ pct: null, note: '无 Fable 权限' })
+  })
+
+  it('omits Fable on tokenless and GPT slots', () => {
+    expect(vmWindows(vm({ has_token: false })).map((w) => w.key)).toEqual([
+      '5h',
+      '7d',
+    ])
   })
 
   it('reports an unprobed or tokenless window as null, not 0%', () => {
