@@ -1,0 +1,94 @@
+# Fork CI for the custom branch. Upstream's `ci` workflow only gates main and
+# PRs; this one gates pushes to the fork's working branch. Kept in its own file
+# so merging upstream never conflicts with it. A green push also publishes the
+# control-plane image through fork-image.
+name: fork-ci
+
+on:
+  push:
+    branches: [feat/custom]
+    paths-ignore:
+      - 'README.md'
+      - 'CHANGELOG.md'
+      - 'docs/**'
+  pull_request:
+    branches: [feat/custom]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Never cancel a push run mid-way: it may be publishing the image.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  node:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - run: npm ci
+      - name: format and syntax
+        run: |
+          npx biome format
+          find src scripts -name '*.mjs' -print0 | xargs -0 -n1 node --check
+      - name: pinned payload
+        run: |
+          node scripts/fetch-payload.mjs
+          node scripts/fetch-payload.mjs --check
+      - run: npm run test:unit
+
+  go:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.25.x'
+          cache-dependency-path: |
+            worker/go.sum
+            api-kernel/go.sum
+      - name: gofmt, vet and test
+        run: |
+          test -z "$(gofmt -l worker api-kernel)" || { gofmt -l worker api-kernel; exit 1; }
+          (cd worker && go vet ./... && go test ./...)
+          (cd api-kernel && go vet ./... && go test ./...)
+
+  web:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10
+          cache: true
+          cache_dependency_path: web/pnpm-lock.yaml
+      - name: format, test and build
+        working-directory: web
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm format:check
+          pnpm test
+          pnpm build
+
+  image:
+    needs: [node, go, web]
+    if: github.event_name == 'push'
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/fork-image.yml
+    with:
+      arm64: true
