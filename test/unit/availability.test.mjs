@@ -30,6 +30,54 @@ test('isQuotaWindowReason matches Extra 5h/7d rejects', () => {
   assert.equal(isQuotaWindowReason('disabled'), false)
 })
 
+test('a Fable request is judged on its own weekly window, not the regular 5h/7d', () => {
+  const now = Date.parse('2026-11-11T00:00:00Z')
+  const reset = new Date(now + 3 * 24 * 3600_000).toISOString()
+  const base = {
+    hasToken: true,
+    hasRefresh: true,
+    schedulable: true,
+    policy: { limit_5h: 0.8, limit_7d: 0.8 },
+    now,
+  }
+  const regularFull = {
+    unified: {
+      headers: {
+        '5h': { utilization: 1, status: 'rejected', reset },
+        '7d': { utilization: 0.95, status: 'allowed', reset },
+      },
+      '7d_oi': { utilization: 0.1, status: 'allowed', reset },
+    },
+  }
+  assert.equal(evaluateAccount({ ...base, account: regularFull }).reason, 'quota_5h_header')
+  const fable = evaluateAccount({ ...base, account: regularFull, model: 'claude-fable-5-2' })
+  assert.equal(fable.accept, true)
+  assert.equal(fable.key, 'ok')
+
+  // A regular-window park on the account is not a Fable cooldown; an auth cooldown still is.
+  const parked = { ...base, account: regularFull, model: 'claude-fable-5-2', cooldownUntil: now + 60_000 }
+  assert.equal(evaluateAccount({ ...parked, cooldownReason: 'quota_7d_safety' }).accept, true)
+  assert.equal(evaluateAccount({ ...parked, cooldownReason: 'account_quota_exhausted' }).accept, true)
+  assert.equal(evaluateAccount({ ...parked, cooldownReason: 'permission_denied' }).key, 'cool')
+
+  const fableFull = {
+    unified: {
+      headers: {
+        '5h': { utilization: 0.1, status: 'allowed', reset },
+        '7d': { utilization: 0.1, status: 'allowed', reset },
+      },
+      '7d_oi': { utilization: 0.95, status: 'allowed', reset },
+    },
+  }
+  const gated = evaluateAccount({ ...base, account: fableFull, model: 'claude-fable-5-2' })
+  assert.equal(gated.accept, false)
+  assert.equal(gated.reason, 'quota_fable_safety')
+  assert.equal(gated.window, '7d_oi')
+  assert.equal(gated.until, Date.parse(reset))
+  assert.equal(evaluateAccount({ ...base, account: fableFull }).accept, true)
+  assert.equal(isQuotaWindowReason('quota_fable_safety'), false)
+})
+
 test('no credential is none', () => {
   const av = evaluateAccount({ vm: {} })
   assert.equal(av.key, 'none')

@@ -460,6 +460,35 @@ test('7d_oi 429 cools fable family not the account', () => {
   assert.equal(policy.cooldownUntil, now + 90_000)
 })
 
+test('a Fable request limit never parks the account, whatever the upstream names', () => {
+  const now = Date.parse('2026-09-23T12:37:10Z')
+  const reset5h = Math.floor((now + 2 * 3600_000) / 1000)
+  const headers = {
+    'anthropic-ratelimit-unified-5h-status': 'rejected',
+    'anthropic-ratelimit-unified-5h-reset': String(reset5h),
+  }
+  const result = { status: 429, body: { error: { type: 'rate_limit_error', message: 'limited' } }, headers }
+  const fable = classifyUpstreamResult(result, { model: 'claude-fable-5-2', now })
+  assert.equal(fable.scope, 'model')
+  assert.equal(fable.model, 'fable')
+  assert.equal(fable.reason, 'fable_rate_limited')
+  assert.equal(fable.cooldownUntil, reset5h * 1000)
+  const regular = classifyUpstreamResult(result, { model: 'claude-sonnet-5', now })
+  assert.equal(regular.scope, 'account')
+  assert.equal(regular.reason, 'account_quota_exhausted')
+
+  const text = classifyUpstreamResult(
+    {
+      status: 502,
+      body: { error: { type: 'api_error', message: "You've hit your limit · resets 4:20pm (America/Los_Angeles)" } },
+    },
+    { model: 'claude-fable-5-2', now },
+  )
+  assert.equal(text.scope, 'model')
+  assert.equal(text.reason, 'fable_rate_limited')
+  assert.equal(text.cooldownUntil, Date.parse('2026-09-23T23:20:00Z'))
+})
+
 test('thinking-only verified hop retries the same account', () => {
   const policy = classifyUpstreamResult({
     ok: true,

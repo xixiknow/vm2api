@@ -98,7 +98,7 @@ import {
   readSlotKernelConfig,
   resolveCragPrintPersona,
 } from './crag-print-prompt.mjs'
-import { repairAnthropicRequest } from '../pool/upstream-error-policy.mjs'
+import { isFableModel, repairAnthropicRequest } from '../pool/upstream-error-policy.mjs'
 import { profileForPreset } from '../identity/official-profiles.mjs'
 import { loadVmIdentity, OFFICIAL_CLI_VERSION } from '../identity/vm-identity.mjs'
 import {
@@ -2088,8 +2088,14 @@ export function createHandleProtocol(deps) {
         ]
           .filter(Boolean)
           .join('\n')
-        const headers = extraHeadersFromLimitError(limitText, result.headers || {})
-        const exhausted = isAccountQuotaExhausted(result, limitText)
+        // Fable has its own weekly quota. Its limit must not be written onto the
+        // regular 5h/7d windows from the error text; real 5h/7d headers on the
+        // response are still recorded by ingestHeaders itself.
+        const fableRequest = isFableModel(ctx.body?.model)
+        const headers = fableRequest
+          ? result.headers || {}
+          : extraHeadersFromLimitError(limitText, result.headers || {})
+        const exhausted = !fableRequest && isAccountQuotaExhausted(result, limitText)
         accountQuota.ingestHeaders(result.accountId, headers, healthReal ? null : logBag.usage, {
           exhausted,
           status: result.status,

@@ -1283,6 +1283,67 @@ test('quota-limited account stays off the picker even when schedulable', async (
   selected.release()
 })
 
+test('a regular 5h limit keeps the account for Fable and off the picker for other models', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const reset = new Date(Date.now() + 4 * 3600_000).toISOString()
+  const limited = {
+    account_id: 'account-1',
+    last_used_at: Date.now(),
+    last_probe: { ok: true, source: 'official-cc-usage', at: new Date().toISOString() },
+    unified: {
+      source: 'official-cc-usage',
+      last_probe: { ok: true, source: 'official-cc-usage', at: new Date().toISOString() },
+      '5h': { utilization: 1, status: 'rejected', reset },
+      '7d': { utilization: 0.1, status: 'allowed' },
+    },
+  }
+  const pool = scheduler(root, {
+    accountQuota: {
+      repo: { get: (id) => (id === 'account-1' ? limited : null) },
+      policyFor: () => ({ limit_5h: 0.85, limit_7d: 0.8 }),
+      canAccept: (id, opts = {}) =>
+        id === 'account-1' && !/fable/.test(String(opts.model || ''))
+          ? { ok: false, reason: 'quota_5h_cli' }
+          : { ok: true },
+    },
+  })
+  const only1 = { excluded: new Set(['account-2']), allowWait: false }
+  const regular = await pool.selectAndReserve({ model: 'claude-test', ...only1 })
+  assert.equal(regular.ok, false)
+  const fable = await pool.selectAndReserve({ model: 'claude-fable-5', ...only1 })
+  assert.equal(fable.ok, true)
+  assert.equal(fable.accountId, 'account-1')
+  fable.release()
+})
+
+test('a regular 429 park does not hold a Fable request, an overload does', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const until = Date.now() + 3_600_000
+  const runtimeRepo = new RuntimeRepo()
+  runtimeRepo.upsert({
+    account_id: 'account-1',
+    vm_id: 'vm-01',
+    rate_limit_reset_at: until,
+    cooldown_until: until,
+    cooldown_reason: 'account_quota_exhausted',
+    status: 'cooldown',
+  })
+  const pool = scheduler(root, { runtimeRepo })
+  const only1 = { excluded: new Set(['account-2']), allowWait: false }
+  const regular = await pool.selectAndReserve({ model: 'claude-test', ...only1 })
+  assert.equal(regular.ok, false)
+  const fable = await pool.selectAndReserve({ model: 'claude-fable-5', ...only1 })
+  assert.equal(fable.ok, true)
+  assert.equal(fable.accountId, 'account-1')
+  fable.release()
+
+  runtimeRepo.upsert({ account_id: 'account-1', vm_id: 'vm-01', rate_limit_reset_at: until, overload_until: until })
+  const overloaded = await pool.selectAndReserve({ model: 'claude-fable-5', ...only1 })
+  assert.equal(overloaded.ok, false)
+})
+
 test('scheduler fails closed when every account is ineligible', async (t) => {
   const root = project()
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))

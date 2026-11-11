@@ -289,6 +289,23 @@ function cooldownActive(until, now) {
 /** Account cooldowns that do not prove the account left the pool. */
 export const SOFT_COOLDOWN_REASONS = new Set(['rpm_limited', 'rate_limited_unknown'])
 
+/**
+ * The hard block that applies to this request. Fable has its own weekly quota,
+ * so a regular-window 429 park (`rate_limit_reset_at`) does not hold a Fable
+ * request; an overload still does.
+ */
+function hardBlockFor(state, model, now = Date.now()) {
+  const block = hardBlockOf(state, now)
+  if (block?.reason !== 'rate_limited' || !isFableModel(model)) return block
+  const overload = Number(state?.overload_until) || 0
+  return overload > now ? { reason: 'overloaded', until: overload } : null
+}
+
+/** A regular 5h/7d quota park on the account, which a Fable request does not wait on. */
+function regularParkFor(state, model) {
+  return isFableModel(model) && isAccountRestrictionReason(state?.cooldown_reason)
+}
+
 /** Concurrency, RPM, and kernel slot-full wait on the bound account. Cooldown / fault must rotate. */
 function stickyShouldWait(waitReason, cooldownReason = null) {
   if (
@@ -1153,7 +1170,7 @@ export class PoolScheduler extends EventEmitter {
   }) {
     // sub2api IsSchedulable: rate_limit_reset_at / overload_until gate before any
     // passive Extra reading or health hop. Pins are diagnostics and still reach the slot.
-    const hardBlock = pinned ? null : hardBlockOf(state, now)
+    const hardBlock = pinned ? null : hardBlockFor(state, model, now)
     if (hardBlock) return { ok: false, reason: hardBlock.reason, until: hardBlock.until }
     let circuitProbeUntil = null
     if (!pinned) {
@@ -1181,6 +1198,7 @@ export class PoolScheduler extends EventEmitter {
       return proxySync
     }
     let headroom = null
+    let fableGateUntil = undefined
     if (!pinned) {
       // Panel switch is vm.schedulable (evaluateSlotGate). accounts.schedulable
       // is a legacy column nothing writes; a leftover 0 must not hide a slot
@@ -1230,6 +1248,7 @@ export class PoolScheduler extends EventEmitter {
         const ev = evaluateAccount({
           vm,
           account: { ...account, last_used_at: lastUsedAt },
+          model,
           hasToken: !!(vm?.claude?.has_access || vm?.has_token),
           hasRefresh: hasRefreshPresence(vm?.claude) || !!vm?.has_refresh,
           schedulable: vm.schedulable !== false,
@@ -1252,11 +1271,14 @@ export class PoolScheduler extends EventEmitter {
         if (!ev.accept) {
           if (ev.key === 'cool') {
             // cooldown is a wait, not a hard skip — handled below
+          } else if (ev.reason === 'quota_fable_safety') {
+            // Fable's own weekly line: a wait until that window resets, like a rejected 7d_oi.
+            fableGateUntil = ev.until || null
           } else {
             return { ok: false, reason: ev.reason || ev.key || 'account_gated' }
           }
         }
-        headroom = budgetHeadroom({ account: { ...account, last_used_at: lastUsedAt }, quota, policy, now })
+        headroom = budgetHeadroom({ account: { ...account, last_used_at: lastUsedAt }, quota, policy, model, now })
       }
       // Operator-set working window: outside it the slot simply is not a
       // candidate. Checked after the model / account gates so only a slot that
@@ -1308,9 +1330,15 @@ export class PoolScheduler extends EventEmitter {
       const next = Number(until) || 0
       if (next > eligibilityNow) availableAt = availableAt ? Math.min(availableAt, next) : next
     }
-    if (state && cooldownActive(state.cooldown_until, eligibilityNow) && !leftoverNoRefreshPark) {
+    if (
+      state &&
+      cooldownActive(state.cooldown_until, eligibilityNow) &&
+      !leftoverNoRefreshPark &&
+      !regularParkFor(state, model)
+    ) {
       markWait('account_cooldown', state.cooldown_until)
     }
+    if (fableGateUntil !== undefined) markWait('fable_quota', fableGateUntil)
     const modelKey = normalizeModel(model)
     for (const key of modelCooldownKeys(modelKey)) {
       const modelState = state?.model_states?.[key]
@@ -1344,14 +1372,16 @@ export class PoolScheduler extends EventEmitter {
     }
     let gateZone = null
     if (this.accountQuota && !pinned) {
-      const quotaGate = this.accountQuota.canAccept(accountId, { tier: vmTierOf(vm), quotaRequest, account })
+      const quotaGate = this.accountQuota.canAccept(accountId, { tier: vmTierOf(vm), quotaRequest, account, model })
       if (!quotaGate.ok) {
         if (quotaGate.reason === 'concurrency_limit') markWait('concurrency_limit')
         else if (quotaGate.reason === 'rpm_limit') markWait('rpm_limit', quotaGate.detail?.reset_at)
         else if (quotaGate.reason === 'quota_band_inflight') markWait('quota_band_inflight')
+        else if (quotaGate.reason === 'quota_fable_safety')
+          markWait('fable_quota', this.accountQuota.fableWindowResetAt?.(accountId, account))
         else return { ok: false, reason: quotaGate.reason || 'quota_gate' }
       }
-      gateZone = this.accountQuota.gateZoneOf?.(accountId, { tier: vmTierOf(vm), account }) || null
+      gateZone = this.accountQuota.gateZoneOf?.(accountId, { tier: vmTierOf(vm), account, model }) || null
     }
     // A sticky preference must not bypass exhausted kernel recovery.
     if (kernelFaults.has(vm.id)) return { ok: false, reason: 'kernel_faulted' }
@@ -1746,12 +1776,13 @@ export class PoolScheduler extends EventEmitter {
     const noRefreshPin = pinned && state?.cooldown_reason === 'oauth_no_refresh'
     if (!noRefreshPin && isCredentialRuntimeBlocked(state, now, vm)) return null
     if (!pinned) {
-      if (hardBlockOf(state, now)) return null
+      if (hardBlockFor(state, candidate.model, now)) return null
       if (account && account.status !== 'active') return null
       if (account) {
         const availability = evaluateAccount({
           vm,
           account,
+          model: candidate.model,
           hasToken: !!(vm.claude?.has_access || vm.has_token),
           hasRefresh: hasRefreshPresence(vm.claude) || !!vm.has_refresh,
           schedulable: vm.schedulable !== false,
@@ -1772,7 +1803,7 @@ export class PoolScheduler extends EventEmitter {
       }
       if (!slotAllowsModel({ vm, account, model: candidate.model }).ok) return null
       if (!evaluateActiveHours(activeHoursOf(vm), now, vm.timezone).active) return null
-      if (cooldownActive(state?.cooldown_until, now)) return null
+      if (cooldownActive(state?.cooldown_until, now) && !regularParkFor(state, candidate.model)) return null
       if (isFableModel(candidate.model) && this.accountQuota?.fableWindowLimited?.(candidate.accountId, now, account))
         return null
       if (
@@ -1809,6 +1840,7 @@ export class PoolScheduler extends EventEmitter {
       tier: vmTierOf(candidate.vm),
       quotaRequest: candidate.quotaRequest,
       account: snapshot.account,
+      model: candidate.model,
     })
     if (quotaReservation && !quotaReservation.ok) return null
     // A pin is an operator diagnostic: it reaches the slot without taking the probe.

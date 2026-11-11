@@ -5,13 +5,15 @@
 
 import {
   effectiveRateWindow,
+  fableWindowOrEmpty,
   headerHardBlocked,
   headerWindowOrEmpty,
+  isFableModel,
   parseResetMs,
   WINDOW_5H_MS,
   WINDOW_7D_MS,
 } from './quota-window.mjs'
-import { GATE_DRAINING, GATE_GATED, gateZone, quotaGateOf } from './quota-gate.mjs'
+import { GATE_DRAINING, GATE_GATED, GATE_OPEN, gateZone, quotaGateOf } from './quota-gate.mjs'
 import { DEFAULT_TIER_POLICIES } from './quota-tiers.mjs'
 import { resolveSlotState } from './schedule-state.mjs'
 import { isOfficialUsageRateLimited } from '../oauth/crs-usage-probe.mjs'
@@ -182,10 +184,14 @@ function usageWindows(quota = {}, account = {}, now = Date.now()) {
 
 /**
  * Seat budget headroom: min(limit_5h − u5, limit_7d − u7) with the same
- * windows and safety lines evaluateAccount admits against.
+ * windows and safety lines evaluateAccount admits against. A Fable request
+ * has its own weekly window: limit_7d − u(7d_oi).
  */
-export function budgetHeadroom({ account = {}, quota = {}, policy = null, now = Date.now() } = {}) {
+export function budgetHeadroom({ account = {}, quota = {}, policy = null, model = null, now = Date.now() } = {}) {
   const pol = policyOf({ policy })
+  if (isFableModel(model)) {
+    return pol.limit_7d - utilRatio(fableWindowOrEmpty(account?.unified || {}, { now }).utilization)
+  }
   const { u5, u7 } = usageWindows(quota || {}, account || {}, now)
   return Math.min(pol.limit_5h - u5, pol.limit_7d - u7)
 }
@@ -228,10 +234,14 @@ function quotaUntilMs(quota = {}, window = '5h', now = Date.now()) {
  *
  * usable  = 账号还在（票活着且未人工出池）。额度闸上门仍为 true，通知不报池空。
  * accept  = 能否接 /v1。闸上门为 false。
+ *
+ * `model` 只由调度准入传入。Fable 请求走自己的周窗口（7d_oi 对 limit_7d），
+ * 普通 5h/7d 的限制和账号级配额冷却对它不生效。面板不传，判定不变。
  */
 export function evaluateAccount({
   vm = {},
   account = {},
+  model = null,
   hasToken = null,
   hasRefresh = null,
   schedulable = null,
@@ -265,6 +275,7 @@ export function evaluateAccount({
   const probedAt = probe?.at || probe?.probed_at || null
   const base = { source, probed_at: probedAt, in_pool: inPool }
   const pol = policyOf({ policy })
+  const fable = isFableModel(model)
 
   if (!token && !refresh) {
     return finish(base, {
@@ -335,7 +346,7 @@ export function evaluateAccount({
   }
 
   // sub2api IsSchedulable: live rate_limit_reset_at / overload_until win over passive Extra.
-  if (hardBlock?.until > now) {
+  if (hardBlock?.until > now && !(fable && hardBlock.reason === 'rate_limited')) {
     const overloaded = hardBlock.reason === 'overloaded'
     return finish(base, {
       key: overloaded ? 'cool' : 'quota',
@@ -347,7 +358,7 @@ export function evaluateAccount({
     })
   }
 
-  if (headerHardBlocked(account.unified || {}, '5h', now) || headerHardBlocked(quota, '5h', now)) {
+  if (!fable && (headerHardBlocked(account.unified || {}, '5h', now) || headerHardBlocked(quota, '5h', now))) {
     return finish(base, {
       key: 'quota',
       text: '5h 限制',
@@ -358,7 +369,7 @@ export function evaluateAccount({
       until: quotaUntilMs({ ...quota, reset_5h: quota.reset_5h || account.unified?.headers?.['5h']?.reset }, '5h', now),
     })
   }
-  if (headerHardBlocked(account.unified || {}, '7d', now) || headerHardBlocked(quota, '7d', now)) {
+  if (!fable && (headerHardBlocked(account.unified || {}, '7d', now) || headerHardBlocked(quota, '7d', now))) {
     return finish(base, {
       key: 'quota',
       text: '7d 限制',
@@ -372,7 +383,7 @@ export function evaluateAccount({
 
   const { q, u5, u7, w5, w7 } = usageWindows(quota, account, now)
 
-  if (u5 >= 1) {
+  if (!fable && u5 >= 1) {
     return finish(base, {
       key: 'quota',
       text: '5h 限制',
@@ -383,7 +394,7 @@ export function evaluateAccount({
       until: resetUntilMs(w5.reset, now),
     })
   }
-  if (u7 >= 1) {
+  if (!fable && u7 >= 1) {
     return finish(base, {
       key: 'quota',
       text: '7d 限制',
@@ -395,8 +406,21 @@ export function evaluateAccount({
     })
   }
 
-  const z5 = gateZone(u5, pol.limit_5h, pol.gate)
-  const z7 = gateZone(u7, pol.limit_7d, pol.gate)
+  const z5 = fable ? GATE_OPEN : gateZone(u5, pol.limit_5h, pol.gate)
+  const z7 = fable ? GATE_OPEN : gateZone(u7, pol.limit_7d, pol.gate)
+  const wF = fable ? fableWindowOrEmpty(account.unified || {}, { now }) : null
+  const zF = fable ? gateZone(utilRatio(wF.utilization), pol.limit_7d, pol.gate) : GATE_OPEN
+  if (zF === GATE_GATED) {
+    return finish(base, {
+      key: 'quota',
+      text: 'Fable 限制',
+      accept: false,
+      usable: true,
+      reason: 'quota_fable_safety',
+      window: '7d_oi',
+      until: resetUntilMs(wF.reset, now),
+    })
+  }
   if (z5 === GATE_GATED) {
     return finish(base, {
       key: 'quota',
@@ -451,7 +475,9 @@ export function evaluateAccount({
         has_token: token,
         has_refresh: refresh,
       })
-    if (!leftoverRevokeCool) {
+    // A regular-window park (quota line or account 429) does not hold a Fable request.
+    const regularPark = fable && isAccountRestrictionReason(reason)
+    if (!leftoverRevokeCool && !regularPark) {
       if (/oauth_revoked|token has been revoked/i.test(String(reason || ''))) {
         return finish(base, {
           key: 'bad',
@@ -474,11 +500,11 @@ export function evaluateAccount({
   }
   // Near the gate: still admitted (one call at a time, no new seats while an open
   // VM exists), but the console must not paint it as plain 可用.
-  const drainWindow = z5 === GATE_DRAINING ? '5h' : z7 === GATE_DRAINING ? '7d' : null
+  const drainWindow = z5 === GATE_DRAINING ? '5h' : z7 === GATE_DRAINING ? '7d' : zF === GATE_DRAINING ? '7d_oi' : null
   if (drainWindow) {
     return finish(base, {
       key: 'drain',
-      text: `${drainWindow} 临近闸线`,
+      text: `${drainWindow === '7d_oi' ? 'Fable' : drainWindow} 临近闸线`,
       accept: true,
       usable: true,
       reason: `gate_${drainWindow}_draining`,

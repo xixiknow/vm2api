@@ -11,7 +11,7 @@ import {
   ErrorCode,
 } from '../core/errors.mjs'
 import { isContentPolicyErrorCode } from '../core/refusal-guard.mjs'
-import { isPlanLimitMessage, parseLimitResetFromMessage, parseResetMs } from './quota-window.mjs'
+import { isFableModel, isPlanLimitMessage, parseLimitResetFromMessage, parseResetMs } from './quota-window.mjs'
 import { attachFailureDecision } from './unit-decision.mjs'
 
 const ENTITLEMENT_PATTERNS = [
@@ -133,11 +133,7 @@ function isShortWindowLimit(message, headers) {
   })
 }
 
-export function isFableModel(model) {
-  return String(model || '')
-    .toLowerCase()
-    .includes('fable')
-}
+export { isFableModel }
 
 export function modelCooldownKeys(model) {
   const key = normalizeModelKey(model)
@@ -163,6 +159,17 @@ function fableResetFromHeaders(headers, now = Date.now()) {
   }
   const parsed = Date.parse(String(raw))
   return Number.isFinite(parsed) && parsed > now ? parsed : null
+}
+
+/** A Fable limit parks the Fable family on this account until its own reset, else `fallbackUntil`. */
+function fableLimitPolicy(headers, fallbackUntil, now = Date.now()) {
+  return {
+    scope: 'model',
+    action: 'continue-and-cooldown',
+    reason: 'fable_rate_limited',
+    model: FABLE_FAMILY_KEY,
+    cooldownUntil: fableResetFromHeaders(headers, now) || fallbackUntil,
+  }
 }
 
 function isUnifiedAccountLimit(headers) {
@@ -434,6 +441,10 @@ function classifyUpstreamResultRaw(
   // Plan limit arrives as 429, as a kernel 502 provider_error, or (pre-restore)
   // as 200 + SSE error. The text decides, not the status (sub2api handle429).
   if (isPlanLimitMessage(message)) {
+    // Fable has its own weekly quota: its limit parks the Fable family, not the account.
+    if (isFableModel(model)) {
+      return fableLimitPolicy(result.headers, accountLimitUntil(reset, usage, now, message), now)
+    }
     return {
       scope: 'account',
       action: 'continue-and-cooldown',
@@ -582,6 +593,9 @@ function classifyUpstreamResultRaw(
       return { scope: 'request', action: 'stop', reason: 'entitlement_required', cooldownUntil: null }
     }
     if (isUnifiedAccountLimit(result.headers)) {
+      if (isFableModel(model)) {
+        return fableLimitPolicy(result.headers, accountLimitUntil(reset, usage, now, message), now)
+      }
       return {
         scope: 'account',
         action: 'continue-and-cooldown',
@@ -590,14 +604,7 @@ function classifyUpstreamResultRaw(
       }
     }
     if (isFableWindowLimit(result.headers) || isFableModel(model)) {
-      const fableReset = fableResetFromHeaders(result.headers, now) || reset
-      return {
-        scope: 'model',
-        action: 'continue-and-cooldown',
-        reason: 'fable_rate_limited',
-        model: FABLE_FAMILY_KEY,
-        cooldownUntil: fableReset || now + 60_000,
-      }
+      return fableLimitPolicy(result.headers, reset || now + 60_000, now)
     }
     // The model name alone never decides scope (#163): only upstream text
     // naming a model family proves a model limit, and only a per-minute

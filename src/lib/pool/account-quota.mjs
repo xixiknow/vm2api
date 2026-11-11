@@ -16,9 +16,11 @@ import {
   applyEffectiveWindows,
   extraHeadersFromLimitError,
   extraIsLiveOpen,
+  fableWindowOrEmpty,
   headerHardBlocked,
   headerWindow,
   headerWindowOrEmpty,
+  isFableModel,
   leftoverClearHeaderWindows,
   listQuotaFromHeaders,
   officialWindow,
@@ -565,9 +567,17 @@ export class AccountQuota {
     for (const vm of vms || []) this.setVmQuotaOverride(vm?.id, vm?.quota_override || null)
   }
 
-  canAccept(accountId, { tier = null, requestRisk = null, quotaRequest = null, account = undefined } = {}) {
+  /**
+   * `model` picks the quota lane. A Fable request is gated on its own weekly
+   * window (`7d_oi`) against `limit_7d`; the regular 5h/7d windows do not apply to it.
+   */
+  canAccept(
+    accountId,
+    { tier = null, requestRisk = null, quotaRequest = null, account = undefined, model = null } = {},
+  ) {
     const acc = account === undefined ? this.ensure({ account_id: accountId }) : account
     if (!acc) return { ok: false, reason: 'account_missing' }
+    const fable = isFableModel(model)
     const policy = this.policyFor(acc, { tier })
     const ratio = Number(policy.limit_5h ?? policy.safety_ratio ?? this.config.safety_ratio ?? 0.85)
     const weeklyRatio = Number(
@@ -588,7 +598,7 @@ export class AccountQuota {
       }
     }
 
-    if (quotaConfig.block_on_5h && headerHardBlocked(acc.unified, '5h')) {
+    if (!fable && quotaConfig.block_on_5h && headerHardBlocked(acc.unified, '5h')) {
       const h5 = headerWindow(acc.unified, '5h')
       acc.last_blocked = { at: new Date().toISOString(), window: '5h', status: h5.status, source: 'headers' }
       if (account === undefined) this.repo.save(acc)
@@ -602,7 +612,7 @@ export class AccountQuota {
         },
       }
     }
-    if (quotaConfig.block_on_7d && headerHardBlocked(acc.unified, '7d')) {
+    if (!fable && quotaConfig.block_on_7d && headerHardBlocked(acc.unified, '7d')) {
       const h7 = headerWindow(acc.unified, '7d')
       acc.last_blocked = { at: new Date().toISOString(), window: '7d', status: h7.status, source: 'headers' }
       if (account === undefined) this.repo.save(acc)
@@ -621,8 +631,26 @@ export class AccountQuota {
     const w7 = headerWindowOrEmpty(acc.unified, '7d')
     const u5 = asUtilRatio(w5.utilization)
     const u7 = asUtilRatio(w7.utilization)
-    const z5 = quotaConfig.block_on_5h ? gateZone(u5, ratio, gate) : GATE_OPEN
-    const z7 = quotaConfig.block_on_7d ? gateZone(u7, weeklyRatio, gate) : GATE_OPEN
+    const wF = fableWindowOrEmpty(acc.unified)
+    const uF = asUtilRatio(wF.utilization)
+    const z5 = !fable && quotaConfig.block_on_5h ? gateZone(u5, ratio, gate) : GATE_OPEN
+    const z7 = !fable && quotaConfig.block_on_7d ? gateZone(u7, weeklyRatio, gate) : GATE_OPEN
+    const zF = fable && quotaConfig.block_on_7d ? gateZone(uF, weeklyRatio, gate) : GATE_OPEN
+
+    if (zF === GATE_GATED) {
+      return {
+        ok: false,
+        reason: 'quota_fable_safety',
+        detail: {
+          utilization: uF,
+          limit_7d: weeklyRatio,
+          gate_overshoot: gate.overshoot,
+          inflight,
+          reset: wF.reset,
+          message: `Fable weekly usage ${(uF * 100).toFixed(1)}% ≥ weekly ${(weeklyRatio * 100).toFixed(0)}% + ${(gate.overshoot * 100).toFixed(0)}% overshoot; request blocked to protect the Fable quota`,
+        },
+      }
+    }
 
     if (z5 === GATE_GATED) {
       acc.last_blocked = { at: new Date().toISOString(), window: '5h', utilization: u5, status: w5.status }
@@ -663,17 +691,19 @@ export class AccountQuota {
 
     const in5 = z5 === GATE_DRAINING
     const in7 = z7 === GATE_DRAINING
+    const inF = zF === GATE_DRAINING
     // The header reading predates calls already in flight: near the line, one call
     // at a time. This is a wait on this account (the scheduler keeps the seat
     // here), not a reason to leave it.
-    if (inflight > 0 && (in5 || in7)) {
+    if (inflight > 0 && (in5 || in7 || inF)) {
       return {
         ok: false,
         reason: 'quota_band_inflight',
         detail: {
-          window: in5 ? '5h' : '7d',
+          window: in5 ? '5h' : in7 ? '7d' : '7d_oi',
           utilization_5h: u5,
           utilization_7d: u7,
+          utilization_7d_oi: uF,
           limit_5h: ratio,
           limit_7d: weeklyRatio,
           band,
@@ -695,7 +725,7 @@ export class AccountQuota {
       }
     }
     const stale = this.staleSettled.get(accountId) || 0
-    if (guardLargeColdEnabled(quotaConfig) && (in5 || in7)) {
+    if (guardLargeColdEnabled(quotaConfig) && (in5 || in7 || inF)) {
       const risk = resolveRequestRisk({ requestRisk, quotaRequest }, accountId, quotaConfig)
       const tooLarge = this._requestTooLargeInBand({ quotaConfig, risk, stale })
       if (tooLarge) {
@@ -740,7 +770,7 @@ export class AccountQuota {
     if (inflight >= limit) {
       return { ok: false, reason: 'concurrency_limit', detail: { inflight, max: limit, source: 'quota-reservation' } }
     }
-    const inBand = this.gateZoneOf(accountId, { tier: opts.tier, account: acc }) === GATE_DRAINING
+    const inBand = this.gateZoneOf(accountId, { tier: opts.tier, account: acc, model: opts.model }) === GATE_DRAINING
     const stack = this.reservationBand.get(accountId) || []
     stack.push(inBand)
     this.reservationBand.set(accountId, stack)
@@ -825,7 +855,7 @@ export class AccountQuota {
    * The stricter 5h/7d gate zone for this account (see quota-gate.mjs), with
    * the block switches applied. Used by the seat planner to place new devices.
    */
-  gateZoneOf(accountId, { tier = null, account = undefined } = {}) {
+  gateZoneOf(accountId, { tier = null, account = undefined, model = null } = {}) {
     const acc = account === undefined ? this.ensure({ account_id: accountId }) : account
     const policy = this.policyFor(acc, { tier })
     const quotaConfig = this.quotaConfigFor(acc)
@@ -834,6 +864,10 @@ export class AccountQuota {
     const weeklyRatio = Number(
       policy.limit_7d ?? policy.weekly_safety_ratio ?? this.config.weekly_safety_ratio ?? ratio,
     )
+    if (isFableModel(model)) {
+      const uF = asUtilRatio(fableWindowOrEmpty(acc.unified).utilization)
+      return quotaConfig.block_on_7d ? gateZone(uF, weeklyRatio, gate) : GATE_OPEN
+    }
     const u5 = asUtilRatio(headerWindowOrEmpty(acc.unified, '5h').utilization)
     const u7 = asUtilRatio(headerWindowOrEmpty(acc.unified, '7d').utilization)
     const z5 = quotaConfig.block_on_5h ? gateZone(u5, ratio, gate) : GATE_OPEN

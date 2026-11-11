@@ -690,6 +690,56 @@ test('7d_oi window is Fable-only and does not block the account', () => {
   assert.equal(q.fableWindowResetAt('acc-oi'), Date.parse(reset))
 })
 
+test('regular 5h/7d limits do not gate a Fable request', () => {
+  const q = new AccountQuota({
+    dataDir: tmpDir(),
+    config: { quota: { safety_ratio: 0.8, weekly_safety_ratio: 0.8, block_on_5h: true, block_on_7d: true } },
+  })
+  q.ingestHeaders('acc-lane', {
+    'anthropic-ratelimit-unified-5h-utilization': '1',
+    'anthropic-ratelimit-unified-5h-status': 'rejected',
+    'anthropic-ratelimit-unified-5h-reset': futureReset(3600_000),
+    'anthropic-ratelimit-unified-7d-utilization': '0.99',
+    'anthropic-ratelimit-unified-7d-status': 'allowed',
+    'anthropic-ratelimit-unified-7d-reset': futureReset(3 * 24 * 3600_000),
+    'anthropic-ratelimit-unified-7d_oi-utilization': '0.1',
+    'anthropic-ratelimit-unified-7d_oi-status': 'allowed',
+    'anthropic-ratelimit-unified-7d_oi-reset': futureReset(3 * 24 * 3600_000),
+  })
+  assert.equal(q.canAccept('acc-lane', { model: 'claude-sonnet-5' }).reason, 'quota_5h_cli')
+  assert.equal(q.canAccept('acc-lane').ok, false)
+  assert.equal(q.canAccept('acc-lane', { model: 'claude-fable-5-2' }).ok, true)
+  assert.equal(q.gateZoneOf('acc-lane', { model: 'claude-fable-5-2' }), 'open')
+  assert.equal(q.gateZoneOf('acc-lane'), 'gated')
+  const held = q.tryAcquire('acc-lane', { model: 'claude-fable-5-2' })
+  assert.equal(held.ok, true)
+  q.release('acc-lane')
+})
+
+test('Fable is gated on its own weekly window against limit_7d', () => {
+  const q = new AccountQuota({
+    dataDir: tmpDir(),
+    config: { quota: { safety_ratio: 0.8, weekly_safety_ratio: 0.8, block_on_5h: true, block_on_7d: true } },
+  })
+  const reset = futureReset(3 * 24 * 3600_000)
+  q.ingestHeaders('acc-fable-line', {
+    'anthropic-ratelimit-unified-5h-utilization': '0.1',
+    'anthropic-ratelimit-unified-5h-status': 'allowed',
+    'anthropic-ratelimit-unified-7d-utilization': '0.1',
+    'anthropic-ratelimit-unified-7d-status': 'allowed',
+    'anthropic-ratelimit-unified-7d_oi-utilization': '0.99',
+    'anthropic-ratelimit-unified-7d_oi-status': 'allowed',
+    'anthropic-ratelimit-unified-7d_oi-reset': reset,
+  })
+  const gate = q.canAccept('acc-fable-line', { model: 'claude-fable-5-2' })
+  assert.equal(gate.ok, false)
+  assert.equal(gate.reason, 'quota_fable_safety')
+  assert.equal(gate.detail.reset, reset)
+  assert.equal(q.gateZoneOf('acc-fable-line', { model: 'claude-fable-5-2' }), 'gated')
+  assert.equal(q.canAccept('acc-fable-line', { model: 'claude-sonnet-5' }).ok, true)
+  assert.equal(q.gateZoneOf('acc-fable-line'), 'open')
+})
+
 test('7d_oi rejected with elapsed second-level reset is not Fable-limited', () => {
   const q = new AccountQuota({
     dataDir: tmpDir(),

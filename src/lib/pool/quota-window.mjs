@@ -176,6 +176,24 @@ export function headerWindowOrEmpty(unified = {}, key = '5h', { now = Date.now()
   }
 }
 
+/** Fable models draw on their own weekly window (`7d_oi`), not the regular 5h/7d. */
+export function isFableModel(model) {
+  return String(model || '')
+    .toLowerCase()
+    .includes('fable')
+}
+
+/** Fable weekly window (`7d_oi`) for the Fable gate. Elapsed reset is 0 / active. */
+export function fableWindowOrEmpty(unified = {}, { now = Date.now() } = {}) {
+  const raw = windowHasData(unified?.['7d_oi']) ? unified['7d_oi'] : unified?.headers?.['7d_oi']
+  if (!windowHasData(raw)) return { utilization: null, reset: null, status: null }
+  const resetMs = parseResetMs(raw.reset)
+  if (Number.isFinite(resetMs) && resetMs <= now) {
+    return { utilization: 0, status: 'active', reset: raw.reset ?? null, stale: true, stale_reason: 'reset_elapsed' }
+  }
+  return { utilization: raw.utilization ?? null, reset: raw.reset ?? null, status: raw.status ?? null }
+}
+
 function wipeElapsedWindow(window, now) {
   if (!windowHasData(window)) return null
   const resetMs = parseResetMs(window.reset)

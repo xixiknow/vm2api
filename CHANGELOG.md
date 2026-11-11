@@ -4,6 +4,7 @@
 
 - CRAG v2 子进程连 OAuth token 主机（`platform.claude.com` / `console.anthropic.com` 的 443）时先写 `KIN-BLOCK`。kin-egress 在拨上游 SOCKS 之前关掉这条连接，刷新请求不出站。登录、`kin-oauth-auth` 和 `kin-worker oauth refresh` 不写标记，不受影响。
 - Fable 不再要求 Max 订阅。Pro 和未标明等级的槽可以接 `claude-fable-*`；型号拒绝和允许列表仍生效。号池空了按原来的冷却或无可用账号返回，不再一律报 `fable_requires_max`。
+- Fable 按独立周额度调度。`claude-fable-*` 请求只看 Fable 周窗口（`7d_oi`）：用量到分档的 `limit_7d` 配额线，或上游把该窗口标成 rejected 时，这个账号的 Fable 等到窗口重置。普通 5h / 7d 到线、账号级配额冷却和普通模型的 429 不再挡 Fable。反过来，Fable 请求的 429 和限额文案只冷却该账号的 Fable，不再把账号标成 5h 用尽，普通模型照常调度。面板的 5h / 7d 状态显示不变。
 
 ## 1.4.061 — 2026-11-10
 
