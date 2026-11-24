@@ -706,6 +706,21 @@ export function createPanelHandler(ctx) {
     return fillVmTimezoneFromExit(cfg.paths.project, proxyPool, id)
   }
 
+  // GPT password login (fork): background imports reuse the panel's commit and bring-up.
+  ctx.codexLogin?.attachPanel?.({
+    commitCodex: ({ vmPath, existing, account }) =>
+      commitImportedCodexVm({
+        cfg,
+        vmPath,
+        existing,
+        account,
+        catalogClientVersion: ctx.routingConfig?.codex?.catalog_client_version,
+        routingConfig: ctx.routingConfig || {},
+      }),
+    bringUpImportedVm,
+    fillTimezoneFromExit,
+  })
+
   /**
    * Geo-probe through the slot's real exit: its bound SOCKS5, or the local row
    * of the VPS that runs it (control plane, or the node's own route). A local
@@ -1654,6 +1669,8 @@ export function createPanelHandler(ctx) {
         return json(res, 200, panel.ok(onboardingPayloadFor(req, ctx)))
       }
       if (p.startsWith('/api/panel/cluster/')) return ctx.clusterRoutes.handle(req, res, url)
+      if (p.startsWith('/api/panel/codex-login/') && ctx.codexLoginRoutes)
+        return ctx.codexLoginRoutes.handle(req, res, url)
       if (req.method === 'GET' && p === '/api/panel/database/metrics') {
         const snapshot = snapshotDatabaseMetrics({
           db: getDb(),
@@ -3823,6 +3840,9 @@ export function createPanelHandler(ctx) {
         // drop the DB credential mirror row too
         try {
           removeVmFromDb(id)
+        } catch {}
+        try {
+          ctx.codexLogin?.onVmDeleted?.(id)
         } catch {}
         // optional chat side files
         try {

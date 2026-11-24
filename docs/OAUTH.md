@@ -132,3 +132,22 @@ SSH 扩展槽同样由控制面经绑定出口换票。拿到授权后，提交�
 - `GET/POST /api/panel/vms/:id/official-cc-bootstrap`：初装进度 / 手动再跑。
 
 Claude CLI 不参与推理或 token rotation；只在初装窗口启动一次。
+
+## GPT 密码登录（外部登录服务，fork）
+
+vm2api 自己不实现 OpenAI 的「邮箱 + 密码 + 2FA」登录协议，交给管理员在 设置 → GPT 登录 配置的外部服务。协议与 sub2api 的重登接口兼容，多一个 `proxy` 字段：
+
+```text
+POST {endpoint}
+{"action":"start","email":"…","auth_mode":"password_2fa","password":"…","mfa_secret":"…","proxy":"socks5h://user:pass@host:port"}
+→ NDJSON 事件流或单个 JSON。心跳 / 进度跳过；第一个 {"type":"result","payload":{…}}，
+  或带 credential / error / 终态 status 的对象决定结果。credential 必须有 access_token、refresh_token、id_token。
+```
+
+- **出口不变量的例外**：这一步由登录服务发起，不是 vm2api 直连。为了让登录与推理同一 IP，请求带上该槽出口（`hostProxyUrlForVm`）；服务必须用它登录。本机出口且宿主没配部署代理时没有可传的地址，不发 `proxy`，界面标「登录没有走槽位出口」。
+- **信任**：服务拿到账号密码、2FA 长期密钥和槽位代理账号，只能用自建或完全可信的服务。代码不内置默认地址；公网地址必须 HTTPS，不跟随重定向（避免把密码转给别的主机）。错误只回短码，不透传服务正文。
+- **身份**：邮箱和 ChatGPT 账号 ID 一律从返回的 JWT 读，不信服务回显的字段。邮箱与输入不符就丢弃，不建槽、不覆盖。
+- **首次批量导入**：查重（邮箱、账号 ID 已在某个 GPT 槽则跳过）→ 用包导入路径建空槽并分配出口 → 登录 → 校验身份 → `commitImportedCodexVm` 写入并起槽。登录失败删掉空槽。
+- **登录资料**：勾选保存时，邮箱、密码、2FA 存在 SQLite `settings.codex_login:<vmId>`，密码与 2FA 用 `VM2API_DB_SECRET` 加密；没配密钥拒绝保存。换密钥后解不开，界面提示重填。删槽时一并删除。
+- **重登**：手动或自动共用一个队列（每槽一个、全局两个）。经槽位当前出口登录，身份必须与登记邮箱、槽位现有账号 ID 一致；成功后写回凭证（以 `credential_import` 解除不可调度）并重启该槽 Codex 内核丢掉旧 token。失败冷却 30 分钟，连续 3 次失败暂停自动重登，改密码或手动恢复后继续。
+- **失效巡检**：每分钟取最多 5 个到期槽，经槽位出口拉 ChatGPT 模型列表（不发付费请求）。鉴权错误先重读 `codex-credentials.json`（内核可能已轮换），再刷新一次；刷新被拒或没有 refresh token 才算一次失败。默认连续 2 次判定失效：`oauth_invalid_grant` 出池并排队自动重登。刷新成功但仍被拒的归为账号问题，不重登。GPT 请求遇到 401 会让该槽下一轮优先巡检。

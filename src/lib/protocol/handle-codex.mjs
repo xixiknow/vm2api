@@ -39,6 +39,7 @@ import { isLocalEgressProxy } from '../vm/egress.mjs'
 import { vmNodeId } from '../cluster/placement.mjs'
 import { hostProxyUrlForVm } from '../vm/slot-host.mjs'
 import { readCodexAccounts, upsertCodexAccount } from '../vm/codex-slot.mjs'
+import { noteCodexAuthFailure } from '../oauth/codex-login-guard.mjs'
 import { scopeAccountFromVm } from './jev-intercept.mjs'
 import {
   CODEX_APP_VERSION,
@@ -968,6 +969,7 @@ export async function handleCodexProtocol({
         reportOpenAIAttempt(vm.id, attemptKind, result?.ttftMs ?? null)
         const failureHold = codexFailureHold(result)
         if (failureHold) holdOpenAIAccount(vm.id, failureHold)
+        if (failureHold?.reason === 'oauth_401') noteCodexAuthFailure(vm.id)
         if (res.headersSent || hopEmitted) {
           stats.errors++
           logBag.error_code = result?.body?.error?.code || 'codex_upstream'

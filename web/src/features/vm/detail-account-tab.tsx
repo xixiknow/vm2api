@@ -21,6 +21,7 @@ import {
   TooltipTrigger,
 } from '@/components/ui/tooltip'
 import { StatusMark } from '@/components/status-mark'
+import { CodexLoginSlotCard } from '@/features/codex-login/slot-login-card'
 import { AllowedModelsCard } from '@/features/vm/allowed-models-card'
 import { AuthSchemeEditor } from '@/features/vm/auth-scheme-editor'
 import { CodexCredentialPanel } from '@/features/vm/codex-credential-panel'
@@ -340,6 +341,8 @@ export function VmAccountTab(props: VmAccountTabProps) {
           {credTypeLabel(credType)}。
         </p>
       ) : null}
+
+      {gpt && perms.admin ? <CodexLoginSlotCard vmId={id} /> : null}
 
       <AllowedModelsCard vm={vm} />
     </TabsContent>

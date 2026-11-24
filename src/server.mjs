@@ -109,6 +109,8 @@ import { createResponsesWsHandler } from './lib/protocol/responses-ws.mjs'
 import { handleUserUsage } from './lib/protocol/user-count-tokens.mjs'
 import { createKeySelfHandler, KEY_SELF_PATHS } from './lib/protocol/key-self.mjs'
 import { createPanelHandler } from './lib/admin/panel-routes.mjs'
+import { createCodexLoginRoutes } from './lib/admin/codex-login-routes.mjs'
+import { createCodexLoginRuntime } from './lib/oauth/codex-login-runtime.mjs'
 
 const FEATURES = [
   'passthrough',
@@ -961,6 +963,16 @@ cliNodeGuard = createCliNodeGuard({
   liveTokens: () => slotShell.liveShellTokens?.() || [],
 })
 
+// GPT password login (fork): batch import, password re-login and the credential guard.
+const codexLogin = createCodexLoginRuntime({
+  projectRoot: cfg.paths.project,
+  proxyPool: () => proxyPool,
+  getRouting: () => routingConfig,
+  historicIds: () =>
+    (accountQuota?.snapshot?.().accounts || []).flatMap((a) => [{ id: a.vm_id }, { id: a.account_id }]),
+})
+const codexLoginRoutes = createCodexLoginRoutes({ runtime: codexLogin, json, readBody, ok: panel.ok })
+
 const handlePanel = createPanelHandler({
   json,
   writeSSEHeaders,
@@ -1030,7 +1042,10 @@ const handlePanel = createPanelHandler({
   clusterRoutes,
   clusterManager,
   slotShell,
+  codexLogin,
+  codexLoginRoutes,
 })
+codexLogin.start()
 
 const gracefulShutdown = createGracefulShutdown({
   beforeDrain: async () => {
@@ -1064,6 +1079,9 @@ const gracefulShutdown = createGracefulShutdown({
     } catch {}
     try {
       notifyMonitor?.stop?.()
+    } catch {}
+    try {
+      codexLogin.stop()
     } catch {}
   },
   afterDrain: async () => {

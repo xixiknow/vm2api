@@ -6,6 +6,7 @@ import {
   Fingerprint,
   Gauge,
   Info,
+  KeyRound,
   Layers,
   Magnet,
   Network,
@@ -21,6 +22,7 @@ export const SETTINGS_TABS = [
   ['pool', '账号池'],
   ['quota', '配额'],
   ['openai', 'OpenAI'],
+  ['gptlogin', 'GPT 登录'],
   ['logs', '日志'],
   ['protocol', '协议'],
   ['redaction', '脱敏'],
@@ -50,6 +52,7 @@ export const SETTINGS_NAV_GROUPS: {
       { id: 'pool', icon: Layers },
       { id: 'quota', icon: Gauge },
       { id: 'openai', icon: Bot },
+      { id: 'gptlogin', icon: KeyRound },
     ],
   },
   {

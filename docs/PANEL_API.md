@@ -609,6 +609,23 @@ sessionKey / 授权码导入必须走该槽 SOCKS5。
 - 直连通道：远程槽的 kernel / worker 请求默认在节点那一条 SSH 长连接里各开一个通道，长时间零碎流量会让这条连接的拥塞窗口卡在很低的值（实测约 17KB/s），突发的请求正文全部排队。`PUT /direct-link` 后控制面经 SSH 在节点上建 `kin-slot-gate`（宿主网络、只读挂载 `<root>/vms`、监听 `0.0.0.0:<port>`），之后每个槽连接是一条独立的 TLS 1.3 连接。gate 首次启动自签证书（`<root>/gate/tls/`），控制面经已固定主机密钥的 SSH 读取并固定其 SHA-256，指纹不符即不发令牌；每节点随机令牌加密存库，令牌与指纹任何响应都不回传。请求正文紧跟前言发出，不等 gate 应答。gate 只连 `<root>/vms/<vm>/run/{kernel,worker}.sock`，以 `O_PATH|O_NOFOLLOW` 打开，不跟随槽内植入的符号链接。连不上、证书不符或令牌被拒时该节点退回 SSH 30 秒，健康检查 ping 成功即恢复；Docker、终端、健康检查始终走 SSH。**节点防火墙应只对控制面出口 IP 放行该端口**（令牌之外的第二道门）。`direct_link.state`：`ok` 直连、`down` 已退回 SSH（`error` 为原因）、`pending` 尚未检查或尚未固定证书；`gate_error` 为节点端创建失败原因（如节点上还没有槽位镜像）。
 - 本机 Docker 桥：每个节点在 `<data>/cluster/<id>/docker.sock`（0600）监听，`docker -H unix://…/docker.sock ps` 直接操作远端 daemon。数据目录所在文件系统不支持 unix socket（如 WSL `/mnt/*`）时设 `VM2API_CLUSTER_SOCKET_DIR`。
 
+## GPT 密码登录（仅 admin）
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET/PUT | `/codex-login/service` | 登录服务地址、额外请求头、单次超时（1–60 分钟，默认 25）、批量并发（1–8，默认 2）、失效巡检开关与规则 |
+| POST | `/codex-login/batches` | `{ text, exit_mode: "pool"\|"local", save_login, name_prefix }` 开一个批次，202。同一时间只能有一个 |
+| GET | `/codex-login/batches/current` | 当前批次逐行状态；没有批次时 `data: null` |
+| POST | `/codex-login/batches/:id/cancel` · `/retry` | 停止（中断正在登录的行并删掉它的空槽）/ 重试未完成的行 |
+| DELETE | `/codex-login/batches/:id` | 清除批次结果和内存里的密码 |
+| GET | `/codex-login/profiles` | 登记了密码登录的槽位，含巡检与重登状态 |
+| GET/PUT/DELETE | `/codex-login/profiles/:vmId` | 查看 / 新增或修改（`email`、`password`、`totp_secret`、`totp_clear`、`auto_relogin`、`resume`）/ 删除登录资料 |
+| POST | `/codex-login/profiles/:vmId/relogin` | 立即重登，202 |
+
+`text` 每行 `邮箱----密码----2FA密钥` 或逗号分隔，最多 100 行，空行与 `#` 注释跳过；任何一行不合法整批拒收（400，`error.line` 给行号，不回显行内容）。`save_login`（默认 true）要求服务端配置 `VM2API_DB_SECRET`，否则 409 `encryption_required`。行状态：`pending`、`checking`、`provisioning`、`logging_in`、`importing`、`created`、`skipped`、`failed`、`import_failed`；`error` / `detail` / `warning` 是短码，不含上游正文。批次只在内存：已完成的行立刻丢掉密码，失败行留到批次结束后 30 分钟供重试，进程重启后批次消失。
+
+请求头的值与密码、2FA 一样只写不读：GET 回 `value_set`、`password_set`、`totp_set`，PUT 留空保留原值。登录服务地址公网必须 HTTPS，回环、内网与单段主机名（Docker 服务名）可用 HTTP，不允许地址里带账号密码。所有响应 `Cache-Control: no-store`。
+
 ## 管理口（master）
 
 常用：`GET/PUT /admin/routing`、`GET /admin/vms`、`POST /admin/vms/probe-all`、`GET /admin/usage/summary`、`GET /admin/vm/oauth`、`POST /admin/vm/oauth/refresh`、`GET/PUT/DELETE /admin/intercept/rules`。`POST /admin/models/refresh` 只读本地策略目录、回完整目录，不 hop 槽位；`GET /v1/models` 同样不 hop，但按密钥 `group_type` 和 `allowed_models` 过滤。`GET/POST /admin/vm/claude-code/*` 返回 410。

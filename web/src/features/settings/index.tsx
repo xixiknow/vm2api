@@ -20,6 +20,7 @@ import { cn } from '@/lib/utils'
 import { isCodexVm } from '@/lib/vm-kind'
 import { PageHeader } from '@/components/page-header'
 import { QueryGate } from '@/components/query-gate'
+import { CodexLoginPane } from '@/features/codex-login/login-service-pane'
 import { dashboardQueryOptions } from '@/features/overview/queries'
 import { AboutPane } from '@/features/settings/about-pane'
 import { BackupPane } from '@/features/settings/backup-pane'
@@ -199,7 +200,11 @@ export function SettingsPage() {
     serverJson !== null &&
     Object.keys(draft).length > 0 &&
     JSON.stringify(draft) !== serverJson
-  const hideSave = tab === 'socks5' || tab === 'backup' || tab === 'about'
+  const hideSave =
+    tab === 'socks5' ||
+    tab === 'backup' ||
+    tab === 'about' ||
+    tab === 'gptlogin'
   const showSaveBar = dirty && !hideSave
 
   const discard = () => {
@@ -499,6 +504,7 @@ export function SettingsPage() {
                 />
               ) : null}
               {tab === 'socks5' ? <Socks5Pane /> : null}
+              {tab === 'gptlogin' ? <CodexLoginPane /> : null}
               {tab === 'backup' ? <BackupPane /> : null}
               {tab === 'about' ? <AboutPane /> : null}
             </div>
