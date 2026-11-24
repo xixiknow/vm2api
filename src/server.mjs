@@ -83,9 +83,11 @@ import { StickyRouter } from './lib/pool/sticky-router.mjs'
 import { AccountQuota } from './lib/pool/account-quota.mjs'
 import { normalizeTiers } from './lib/pool/quota-tiers.mjs'
 import { ApiKeyStore } from './lib/admin/api-keys.mjs'
-import { keyScopeFromRequest } from './lib/admin/key-scope.mjs'
+import { keyScopeFromRequest, keyTierPolicyFromRecord } from './lib/admin/key-scope.mjs'
+import { ownerScopeFromRequest } from './lib/admin/resource-owner.mjs'
 import { filterModelCatalogForKey } from './lib/admin/key-models.mjs'
 import { GroupsRepo } from './lib/db/repos/groups-repo.mjs'
+import { GeminiOwnersRepo } from './lib/db/repos/gemini-owners-repo.mjs'
 import { SettingsRepo } from './lib/db/repos/settings-repo.mjs'
 import { ApiEndpointStore } from './lib/admin/api-endpoints.mjs'
 import { ApiScheduler } from './lib/pool/api-scheduler.mjs'
@@ -176,6 +178,8 @@ import { createResponsesWsHandler } from './lib/protocol/responses-ws.mjs'
 import { countTokensEnabled, handleUserCountTokens, handleUserUsage } from './lib/protocol/user-count-tokens.mjs'
 import { createKeySelfHandler, KEY_SELF_PATHS } from './lib/protocol/key-self.mjs'
 import { createPanelHandler, syncInstalledKernels } from './lib/admin/panel-routes.mjs'
+import { IntegrationTokenStore } from './lib/admin/integration-tokens.mjs'
+import { createIntegrationHandler } from './lib/admin/integration-routes.mjs'
 import { createCragShopHandler, isCragShopPath, sessionBuyerOwner } from './lib/admin/crag-shop.mjs'
 import { createCodexLoginRoutes } from './lib/admin/codex-login-routes.mjs'
 import { createCodexLoginRuntime } from './lib/oauth/codex-login-runtime.mjs'
@@ -501,6 +505,14 @@ accountQuota.loadVmQuotaOverrides(listVms(cfg.paths.project))
 
 const apiKeyStore = new ApiKeyStore({ dataDir: cfg.paths.data })
 groupsRepo = new GroupsRepo()
+let geminiOwnersRepo = new GeminiOwnersRepo()
+const geminiOwnersProxy = {
+  getOwner: (envId) => geminiOwnersRepo.getOwner(envId),
+  setOwner: (envId, ownerUserId) => geminiOwnersRepo.setOwner(envId, ownerUserId),
+  remove: (envId) => geminiOwnersRepo.remove(envId),
+  ownerMap: () => geminiOwnersRepo.ownerMap(),
+  listEnvIdsByOwner: (ownerUserId) => geminiOwnersRepo.listEnvIdsByOwner(ownerUserId),
+}
 const apiEndpointStore = new ApiEndpointStore({ dataDir: cfg.paths.data })
 const apiScheduler = new ApiScheduler()
 apiScheduler.reload(apiEndpointStore.listRaw())
@@ -829,6 +841,7 @@ backupService.onRestored((db) => {
     store.rebind(db)
   }
   groupsRepo = new GroupsRepo(db)
+  geminiOwnersRepo = new GeminiOwnersRepo(db)
   apiScheduler.reload(apiEndpointStore.listRaw())
 
   routingConfig = loadRoutingConfig()
@@ -1143,6 +1156,9 @@ const { handleProtocol, handleSearch, handleImages } = createHandleProtocol({
   // `id: "messages"` and changed the path the request log attributes.
   handleGeminiMessages: (req, res, opts) => handleGeminiPublic(req, res, opts),
   handleGeminiPublic: (req, res, opts) => handleGeminiPublic(req, res, opts),
+  get geminiScheduler() {
+    return geminiScheduler
+  },
   admitCragInference: (input) => cragSubscription.admitInference(input),
   json,
   writeSSEHeaders,
@@ -1389,10 +1405,11 @@ const geminiCragSubscription = createGeminiCragSubscription({
 const geminiTerminal = createGeminiTerminal({ proxyPool: () => proxyPool })
 const geminiScheduler = createGeminiScheduler({
   callHost: callGeminiHost,
-  resolveProxy: (proxyId) => geminiProxyFor(proxyPool, proxyId),
+  resolveProxy: (proxyId, envOwnerId) => geminiProxyFor(proxyPool, proxyId, { ownerUserId: envOwnerId }),
   poolScheduler,
   apiKeyStore,
   groupsRepo: { rateMultiplier: (id) => groupsRepo.rateMultiplier(id) },
+  geminiOwnersRepo: geminiOwnersProxy,
   cragSubscription: geminiCragSubscription,
   getRoutingConfig: () => routingConfig,
 })
@@ -1402,12 +1419,16 @@ const handleGeminiPublic = createGeminiPublicHandler({
   scheduler: geminiScheduler,
   requestLog,
   groupsRepo: { rateMultiplier: (id) => groupsRepo.rateMultiplier(id) },
+  apiKeyStore,
   getRoutingConfig: () => routingConfig,
 })
+const integrationTokenStore = new IntegrationTokenStore()
 const handlePanel = createPanelHandler({
   getDb,
+  integrationTokenStore,
   cragSubscription,
   geminiCragSubscription,
+  geminiOwnersRepo: geminiOwnersProxy,
   handleCragShop,
   json,
   writeSSEHeaders,
@@ -1481,6 +1502,12 @@ const handlePanel = createPanelHandler({
   codexLoginRoutes,
   slotDesktop,
   geminiTerminal,
+})
+const handleIntegration = createIntegrationHandler({
+  tokenStore: integrationTokenStore,
+  handlePanel,
+  json,
+  readBody,
 })
 
 let geminiTerminalDrain
@@ -1641,7 +1668,11 @@ const server = http.createServer(async (req, res) => {
       // haproxy keeps a standby/draining server out of rotation by state, not by health.
       if (!(role === 'draining' && gracefulShutdown.isShuttingDown())) return json(res, 200, { status: 'ok', role })
     }
-    if (role === 'standby' || (role === 'draining' && (p.startsWith('/admin') || p.startsWith('/api/panel')))) {
+    if (
+      role === 'standby' ||
+      (role === 'draining' &&
+        (p.startsWith('/admin') || p.startsWith('/api/panel') || p.startsWith('/api/integration')))
+    ) {
       // Admin writes go only to the leader; a standby serves nothing until it holds the lock.
       res.setHeader('Connection', 'close')
       return json(res, 503, {
@@ -1696,6 +1727,11 @@ const server = http.createServer(async (req, res) => {
           status: 503,
         }).body,
       )
+    }
+
+    if (p.startsWith('/api/integration')) {
+      const handled = await handleIntegration(req, res, url)
+      if (handled !== false) return
     }
 
     if (p.startsWith('/admin') || p.startsWith('/api/panel')) {
@@ -1765,8 +1801,10 @@ const server = http.createServer(async (req, res) => {
     ) {
       if (!requireAuth(req, res)) return
       const groupType = keyScopeFromRequest(req).group_type
-      if (resolveInferenceBackend(req) === 'api') {
-        const filtered = filterModelCatalogForKey(apiScheduler.catalog(apiScheduleScope(req, groupType)), req)
+      const backend = resolveInferenceBackend(req)
+      const apiScopeForModels = apiScheduleScope(req, groupType, apiKeyStore?.users)
+      if (backend === 'api') {
+        const filtered = filterModelCatalogForKey(apiScheduler.catalog(apiScopeForModels), req)
         if (singleModelGet) {
           const want = singleModelGet.model.replace(/^models\//i, '').toLowerCase()
           const hit = (filtered?.data || []).find((m) => String(m?.id || '').toLowerCase() === want)
@@ -1783,13 +1821,55 @@ const server = http.createServer(async (req, res) => {
         }
         return json(res, 200, p === '/v1beta/models' ? formatGoogleModelList(filtered?.data || []) : filtered)
       }
+      const modelPolicy = req.apiKeyKind === 'managed' ? keyTierPolicyFromRecord(req.apiKeyRecord) : null
+      const modelGeminiScope = {
+        ownerScope: ownerScopeFromRequest(req, apiKeyStore?.users),
+        allowedEnvIds:
+          modelPolicy?.permission_tier === 'resource'
+            ? modelPolicy.allowed_gemini_envs
+            : modelPolicy?.allowed_gemini_envs?.length
+              ? modelPolicy.allowed_gemini_envs
+              : null,
+      }
       if (p === '/v1beta/models' || singleModelGet?.version === 'v1beta' || groupType === 'gemini') {
+        if (backend === 'all') {
+          let gemModels = []
+          try {
+            const gemCat = await geminiScheduler.catalog(modelGeminiScope)
+            gemModels = Array.isArray(gemCat?.models) ? gemCat.models : []
+          } catch {}
+          const apiCat = apiScheduler.catalog(apiScheduleScope(req, 'gemini', apiKeyStore?.users))
+          const merged = []
+          const seen = new Set()
+          for (const m of [...gemModels, ...(apiCat?.data || [])]) {
+            const id = String(m?.id || '').toLowerCase()
+            if (!id || seen.has(id)) continue
+            seen.add(id)
+            merged.push(m)
+          }
+          const filtered = filterModelCatalogForKey({ object: 'list', data: merged }, req)
+          if (singleModelGet) {
+            const want = singleModelGet.model.replace(/^models\//i, '').toLowerCase()
+            const hit = (filtered?.data || []).find((m) => String(m?.id || '').toLowerCase() === want)
+            if (!hit) {
+              return json(res, 404, {
+                error: {
+                  type: 'not_found_error',
+                  code: 'model_not_found',
+                  message: `Model not found: ${singleModelGet.model}`,
+                },
+              })
+            }
+            return json(res, 200, singleModelGet.version === 'v1beta' ? googleModelEntry(hit) : hit)
+          }
+          return json(res, 200, p === '/v1beta/models' ? formatGoogleModelList(filtered?.data || []) : filtered)
+        }
         return handleGeminiPublic(req, res)
       }
       const result = await fetchWorkerModels({ groupType })
       if (groupType === 'all') {
         try {
-          const gemCatalog = await geminiScheduler.catalog()
+          const gemCatalog = await geminiScheduler.catalog(modelGeminiScope)
           if (Array.isArray(gemCatalog?.models) && gemCatalog.models.length) {
             const existing = Array.isArray(result?.data) ? result.data : []
             const seen = new Set(existing.map((m) => m?.id).filter(Boolean))
@@ -1797,6 +1877,15 @@ const server = http.createServer(async (req, res) => {
             if (extra.length) result.data = [...existing, ...extra]
           }
         } catch {}
+      }
+      if (backend === 'all') {
+        const apiCat = apiScheduler.catalog(apiScopeForModels)
+        if (Array.isArray(apiCat?.data) && apiCat.data.length) {
+          const existing = Array.isArray(result?.data) ? result.data : []
+          const seen = new Set(existing.map((m) => String(m?.id || '').toLowerCase()).filter(Boolean))
+          const extra = apiCat.data.filter((m) => m?.id && !seen.has(String(m.id).toLowerCase()))
+          if (extra.length) result.data = [...existing, ...extra]
+        }
       }
       const filtered = filterModelCatalogForKey(result, req)
       if (singleModelGet) {
@@ -1854,11 +1943,40 @@ const server = http.createServer(async (req, res) => {
     if (isGeminiPublicPath(p)) {
       if (!requireAuth(req, res)) return
       const gemGen = req.method === 'POST' ? parseGeminiGeneratePath(p) : null
-      if (gemGen && resolveInferenceBackend(req) === 'api') {
+      const backend = resolveInferenceBackend(req)
+      if (gemGen && backend === 'api') {
         return await handleProtocol(req, res, 'google.gemini', p, {
           routeModel: gemGen.model,
           routeStream: gemGen.stream,
         })
+      }
+      if (gemGen && backend === 'all') {
+        const policy = req.apiKeyKind === 'managed' ? keyTierPolicyFromRecord(req.apiKeyRecord) : null
+        const gemScope = {
+          ownerScope: ownerScopeFromRequest(req, apiKeyStore?.users),
+          allowedEnvIds:
+            policy?.permission_tier === 'resource'
+              ? policy.allowed_gemini_envs
+              : policy?.allowed_gemini_envs?.length
+                ? policy.allowed_gemini_envs
+                : null,
+        }
+        let hasOwnedGemEnv = false
+        try {
+          const cat = await geminiScheduler.catalog(gemScope)
+          hasOwnedGemEnv = Array.isArray(cat?.accounts) && cat.accounts.length > 0
+        } catch {
+          hasOwnedGemEnv = false
+        }
+        if (
+          !hasOwnedGemEnv &&
+          apiScheduler.pick(gemGen.model, Date.now(), apiScheduleScope(req, 'gemini', apiKeyStore?.users))?.ok
+        ) {
+          return await handleProtocol(req, res, 'google.gemini', p, {
+            routeModel: gemGen.model,
+            routeStream: gemGen.stream,
+          })
+        }
       }
       return handleGeminiPublic(req, res)
     }

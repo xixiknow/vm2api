@@ -258,7 +258,7 @@ test('scheduler skips proactively exhausted accounts and fails over on verificat
       },
     },
     {
-      id: 'env-verify-fail',
+      id: 'env-a-verify-fail',
       proxy_id: 'px-2',
       auth_state: 'authorized',
       auth_method: 'oauth',
@@ -268,7 +268,7 @@ test('scheduler skips proactively exhausted accounts and fails over on verificat
       account: { state: 'ok', quotas: [], quota_groups: [] },
     },
     {
-      id: 'env-healthy',
+      id: 'env-b-healthy',
       proxy_id: 'px-3',
       auth_state: 'authorized',
       auth_method: 'oauth',
@@ -288,7 +288,7 @@ test('scheduler skips proactively exhausted accounts and fails over on verificat
     },
     callHostStream: async (_op, payload) => {
       attempted.push(payload.id)
-      if (payload.id === 'env-verify-fail') {
+      if (payload.id === 'env-a-verify-fail') {
         return sseResponse([JSON.stringify({ code: 'gemini_account_verification_required' })], {
           statusCode: 403,
           contentType: 'application/json',
@@ -308,9 +308,9 @@ test('scheduler skips proactively exhausted accounts and fails over on verificat
     geminiBody: { contents: [{ role: 'user', parts: [{ text: 'hello' }] }] },
     apiKeyRecord: { id: 'k-all', group_type: 'all' },
   })
-  assert.equal(turn.account_id, 'env-healthy')
-  // env-exhausted was skipped proactively; env-verify-fail failed over cleanly to env-healthy!
-  assert.deepEqual(attempted, ['env-verify-fail', 'env-healthy'])
+  assert.equal(turn.account_id, 'env-b-healthy')
+  // env-exhausted was skipped proactively; env-a-verify-fail failed over cleanly to env-b-healthy!
+  assert.deepEqual(attempted, ['env-a-verify-fail', 'env-b-healthy'])
 })
 
 test('Gemini builtin pricing & ag- prefix cost resolution cover Google, Anthropic, and OpenAI variants', () => {
@@ -410,6 +410,7 @@ test('Gemini public handler records requestLog once on direct calls and populate
     scheduler,
     requestLog: mockRequestLog,
     groupsRepo: { rateMultiplier: () => 1.5 },
+    apiKeyStore: { users: { getById: () => ({ id: 7, role: 'admin' }) } },
   })
 
   // 1. Direct call (e.g. /v1beta/models/... with `all` key) writes one requestLog entry.
