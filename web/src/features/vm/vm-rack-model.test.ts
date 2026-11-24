@@ -77,6 +77,9 @@ describe('zones', () => {
       off: 1,
       none: 0,
       dead: 2,
+      host_verified: 0,
+      pending: 0,
+      host_failed: 0,
     })
   })
 })
@@ -159,26 +162,66 @@ describe('rackTotals', () => {
     )
     expect(t.ledger[0].tokens).toBe(70)
   })
+
+  it('keeps the mixed total label and amount stable across row order', () => {
+    const archived = vm({
+      id: 'archived',
+      account_uuid: 'acct-1',
+      lifetime_usage: { cost: 30, tokens: 300 },
+      total_cost: 8,
+      total_tokens: 80,
+    })
+    const retained = vm({
+      id: 'retained',
+      account_uuid: 'acct-2',
+      total_cost: 12,
+      total_tokens: 120,
+    })
+    const forward = rackTotals([archived, retained])
+    const reverse = rackTotals([retained, archived])
+    expect(forward.ledger[2]).toMatchObject({
+      key: 'total',
+      label: '总费用',
+      cost: 42,
+      tokens: 420,
+    })
+    expect(reverse.ledger[2]).toEqual(forward.ledger[2])
+  })
 })
 
 describe('vmWindows', () => {
-  it('adds a Fable row for every Claude tier, after 5H and 7D', () => {
-    for (const subscription_type of ['max', 'pro', undefined]) {
-      const r = vmWindows(
-        vm({
-          subscription_type,
-          utilization_7d_oi: 0.3,
-          reset_7d_oi: '2099-01-01T00:00:00Z',
-        })
-      )
-      expect(r.map((w) => w.key)).toEqual(['5h', '7d', 'fable'])
-      expect(r[2].pct).toBe(30)
-    }
+  it('shows measured Fable usage for Pro and Max after 5H and 7D', () => {
+    const max = vmWindows(
+      vm({
+        subscription_type: 'max',
+        usage_has_fable: true,
+        utilization_7d_oi: 0.3,
+        reset_7d_oi: '2099-01-01T00:00:00Z',
+      })
+    )
+    expect(max.map((w) => w.key)).toEqual(['5h', '7d', 'fable'])
+    expect(max[2].pct).toBe(30)
+    const pro = vmWindows(
+      vm({ subscription_type: 'pro', utilization_7d_oi: 0.2 })
+    )
+    expect(pro.map((w) => w.key)).toEqual(['5h', '7d', 'fable'])
+    expect(pro[2].pct).toBe(20)
   })
 
-  it('shows an unprobed Fable window as null and hides it without permission', () => {
-    const unprobed = vmWindows(vm({ subscription_type: 'pro' }))
-    expect(unprobed[2]).toMatchObject({ key: 'fable', pct: null, note: null })
+  it('shows an unknown Fable window as unprobed instead of zero', () => {
+    const windows = vmWindows(vm({ subscription_type: 'pro' }))
+    expect(windows[2]).toMatchObject({
+      key: 'fable',
+      pct: null,
+      note: '未探测',
+    })
+    expect(vmWindows(vm({ platform: 'openai' })).map((w) => w.key)).toEqual([
+      '5h',
+      '7d',
+    ])
+  })
+
+  it('hides the Fable row on slots without Fable permission', () => {
     const denied = vmWindows(
       vm({
         subscription_type: 'max',
@@ -186,13 +229,6 @@ describe('vmWindows', () => {
       })
     )
     expect(denied.map((w) => w.key)).toEqual(['5h', '7d'])
-  })
-
-  it('omits Fable on tokenless and GPT slots', () => {
-    expect(vmWindows(vm({ has_token: false })).map((w) => w.key)).toEqual([
-      '5h',
-      '7d',
-    ])
   })
 
   it('reports an unprobed or tokenless window as null, not 0%', () => {

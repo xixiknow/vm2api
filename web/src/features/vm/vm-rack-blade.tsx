@@ -7,12 +7,15 @@ import {
 import type { UsageAccountRow } from '@/types/panel-usage'
 import type { Vm } from '@/types/panel-vm'
 import { Download, LifeBuoy, Link2, RefreshCw } from 'lucide-react'
-import { credEndpointLabel, credEndpointOf } from '@/lib/cred-type'
 import { fmtAgo, fmtNum, fmtUsd } from '@/lib/format'
-import { subscriptionListLabel } from '@/lib/subscription-expiry'
+import {
+  geminiAccountStatus,
+  geminiEligibilityNotice,
+  geminiInferenceErrorAction,
+  geminiInferenceErrorLabel,
+} from '@/lib/gemini-account-status'
 import { tierVisual } from '@/lib/tier-visual'
 import { cn } from '@/lib/utils'
-import { slotCredentialLabel } from '@/lib/vm-kind'
 import {
   claudeTier,
   credentialStatus,
@@ -24,8 +27,6 @@ import {
 import { vmTotalCost, vmTotalTokens } from '@/lib/vm-usage'
 import { StatusMark } from '@/components/status-mark'
 import { ProxyChip } from '@/features/proxies/proxy-chip'
-import { ActiveVmBadge } from '@/features/vm/active-vm-badge'
-import { runtimeTypeLabel, runtimeTypeOf } from '@/features/vm/machine-spec'
 import {
   SchedulableSwitch,
   vmSchedulableProps,
@@ -35,6 +36,7 @@ import {
   VmQuotaActions,
   VmUsageWindows,
 } from '@/features/vm/usage-windows'
+import { VmAccountIdentity } from '@/features/vm/vm-account-identity'
 import { VmActionMenu } from '@/features/vm/vm-action-menu'
 import { useVmActions } from '@/features/vm/vm-actions-context'
 import { useVmPerms } from '@/features/vm/vm-perms'
@@ -120,9 +122,92 @@ export function BladeControls({
       onClick={(e) => e.stopPropagation()}
       onKeyDown={(e) => e.stopPropagation()}
     >
-      <SchedulableSwitch {...vmSchedulableProps(vm)} />
+      {vm.gemini ? null : <SchedulableSwitch {...vmSchedulableProps(vm)} />}
       <VmActionMenu vm={vm} />
     </div>
+  )
+}
+
+/**
+ * Gemini 槽位状态。表格行（`inline`）只占一行，与普通槽的调度列等高；
+ * 卡片里固定两行：总状态 + 模型/授权，最近推理或唯一一条警示。
+ * 完整证据放在悬停提示里，不再逐条铺开。
+ */
+export function GeminiSlotStatus({
+  vm,
+  inline = false,
+}: {
+  vm: Vm
+  inline?: boolean
+}) {
+  const environment = vm.gemini
+  if (!environment) return null
+  const status = geminiAccountStatus(environment, vm.unschedulable_text)
+  const { authorization, blocker, inference, lastInference, modelsLabel } =
+    status
+  const notice = geminiEligibilityNotice(environment.account, lastInference)
+  const failed =
+    lastInference?.state === 'failed'
+      ? geminiInferenceErrorLabel(lastInference.error_code)
+      : null
+  const failureAction =
+    lastInference?.state === 'failed'
+      ? geminiInferenceErrorAction(lastInference.error_code)
+      : null
+  const at = lastInference?.finished_at ?? lastInference?.started_at
+  const age = at ? fmtAgo(at) || at : ''
+  const run = lastInference
+    ? [lastInference.model, age].filter(Boolean).join(' · ')
+    : null
+  // 只露出一条警示：资格提示优先，其次最近一次失败原因。
+  const warn = notice?.label ?? failed
+  const aside = blocker ? authorization.text : modelsLabel
+  const title = [
+    authorization.text,
+    modelsLabel,
+    blocker ??
+      (environment.auth_state === 'authorized' ? '候选条件已满足' : null),
+    notice ? `${notice.label}：${notice.action}` : null,
+    [inference.text, run, failed].filter(Boolean).join(' · '),
+    failureAction,
+    '仅显示最近一次宿主推理，不代表公共 API 端到端验证',
+  ]
+    .filter(Boolean)
+    .join('\n')
+  const note = (text: string, className?: string) => (
+    <span
+      className={cn(
+        'min-w-0 truncate',
+        warn && text === warn && 'text-[color:var(--status-caution)]',
+        className
+      )}
+    >
+      {text}
+    </span>
+  )
+  if (inline) {
+    return (
+      <span
+        className='flex min-w-0 items-center gap-[7px] text-[11.5px] text-muted-foreground'
+        title={title}
+      >
+        <StatusMark tone={status.tone} className='font-semibold' />
+        {note(warn ?? run ?? aside)}
+      </span>
+    )
+  }
+  return (
+    <span
+      className='grid min-w-0 gap-1 text-xs text-muted-foreground'
+      title={title}
+    >
+      {/* 放不下时整段换到被裁掉的第二行，窄卡只留状态，不截成半个字。 */}
+      <span className='flex h-[22px] min-w-0 flex-wrap items-center gap-x-2 overflow-hidden'>
+        <StatusMark variant='pill' tone={status.tone} />
+        {note(aside, 'shrink-0')}
+      </span>
+      {note(warn ?? run ?? inference.text)}
+    </span>
   )
 }
 
@@ -189,32 +274,6 @@ export function VmSeats({
   )
 }
 
-/** 一行规格：调用形式 · 形态 · 节点 · 出口。替代原先五枚边框 chip。 */
-function SpecLine({ vm }: { vm: Vm }) {
-  const lane = credEndpointOf(vm)
-  const parts = [
-    lane === 'none' ? null : credEndpointLabel(lane),
-    runtimeTypeLabel(runtimeTypeOf(vm)),
-    vm.node_name || vm.node_id || 'local',
-  ].filter(Boolean)
-  return (
-    <div className='flex min-w-0 items-center gap-1.5 overflow-hidden text-[11.5px] whitespace-nowrap text-muted-foreground'>
-      {parts.map((p, i) => (
-        <span key={i} className='flex shrink-0 items-center gap-1.5'>
-          {p}
-          <span
-            aria-hidden='true'
-            className='text-[color:var(--text-tertiary)]'
-          >
-            ·
-          </span>
-        </span>
-      ))}
-      <ProxyChip vm={vm} className='min-w-0 shrink' />
-    </div>
-  )
-}
-
 function Callout({
   tone,
   title,
@@ -273,10 +332,11 @@ function CalloutAction({
 
 function lifeLine(vm: Vm, accounts?: UsageAccountRow[]) {
   const cost = vmTotalCost(vm, accounts)
-  if (!cost) return null
+  const tokens = vmTotalTokens(vm, accounts)
+  if (!cost && !tokens) return null
   return (
     <span className='font-mono text-[11.5px] text-muted-foreground tabular-nums'>
-      总计 {fmtUsd(cost, 2)} · {fmtNum(vmTotalTokens(vm, accounts))} tok
+      总计 {fmtUsd(cost, 2)} · {fmtNum(tokens)} tok
     </span>
   )
 }
@@ -432,8 +492,6 @@ export const VmBlade = memo(function VmBlade({
   const open = useOpenOnKey(vm)
   const state = bladeState(vm)
   const large = size === 'l'
-  const email = String(vm.email || '')
-  const sub = subscriptionListLabel(vm, now)
   const restricted = zoneOf(vm) === 'restricted'
   return (
     <article
@@ -453,45 +511,9 @@ export const VmBlade = memo(function VmBlade({
       {...open}
     >
       <div className='grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-x-2 gap-y-0.5'>
-        <span className='flex min-w-0 items-baseline gap-2'>
-          <span className='font-mono text-[11.5px] text-muted-foreground'>
-            {vm.id}
-          </span>
-          {vm.name && vm.name !== vm.id ? (
-            <span className='truncate text-[11.5px] text-[color:var(--text-tertiary)]'>
-              {vm.name}
-            </span>
-          ) : null}
-        </span>
-        <div className='flex items-center gap-1'>
-          <ActiveVmBadge vm={vm} />
-          <TierBadge vm={vm} />
+        <div className='col-span-2 min-w-0'>
+          <VmAccountIdentity vm={vm} />
         </div>
-        <span
-          title={email || undefined}
-          className={cn(
-            'col-span-2 truncate font-semibold tracking-[-0.012em]',
-            large ? 'text-sm' : 'text-[13px]',
-            email
-              ? state === 'dead'
-                ? 'text-muted-foreground'
-                : ''
-              : 'font-medium text-muted-foreground'
-          )}
-        >
-          {slotCredentialLabel(vm)}
-        </span>
-        <span
-          className={cn(
-            'col-span-2 truncate font-mono text-[11px] tabular-nums',
-            sub.tone === 'bad' && 'text-[color:var(--status-bad)]',
-            sub.tone === 'warn' && 'text-[color:var(--status-warn)]',
-            sub.tone === 'muted' && 'text-muted-foreground'
-          )}
-          title={sub.title}
-        >
-          {sub.text}
-        </span>
         {restricted && state !== 'dead' ? (
           <StatusMark
             variant='pill'
@@ -503,8 +525,10 @@ export const VmBlade = memo(function VmBlade({
           />
         ) : null}
       </div>
-      <SpecLine vm={vm} />
-      {state === 'live' ? (
+      <ProxyChip vm={vm} className='min-w-0 justify-self-start' />
+      {vm.gemini ? (
+        <GeminiSlotStatus vm={vm} />
+      ) : state === 'live' ? (
         <BladeUsage vm={vm} accounts={accounts} now={now} />
       ) : state === 'unprobed' ? (
         <div className='grid min-w-0 content-start gap-1.5'>

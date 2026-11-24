@@ -1,7 +1,8 @@
 import type { Vm } from '@/types/panel-vm'
 import { fableState } from '@/lib/fable-status'
 import { cn } from '@/lib/utils'
-import { claudeTier, fablePlanDenied } from '@/lib/vm-status'
+import { isCodexVm } from '@/lib/vm-kind'
+import { fablePlanDenied } from '@/lib/vm-status'
 
 /** 用量条统一朝一个方向：值越高越危险。四档对应状态轴。 */
 export type RiskLevel = 'ok' | 'caution' | 'warn' | 'bad'
@@ -101,26 +102,20 @@ export function UsageMeter({
 }
 
 export type FableRow =
-  { kind: 'bar'; pct: number | null } | { kind: 'note'; text: string }
+  { kind: 'bar'; pct: number } | { kind: 'note'; text: string }
 
 /**
- * Claude 账号的 Fable 独立额度（7d_oi）。Fable 不再要求 Max（1.4.061），
- * 订阅档也可能是「未识别」，所以只要是有凭证的 Claude 槽就占一行；
- * GPT 槽、无凭证槽返回 null 不占位。
+ * Claude 凭证的 Fable 额度；没有实测读数时展示状态，不画百分比。
+ * 套餐没带 Fable 权限的号返回 null 不占位（fork：有则显示，没有就不显示）。
  *
- * 未探测时 `pct: null`，和 5H / 7D 一样画「—」，不画 0% 冒充还很空。
- * 套餐没带 Fable 权限的号返回 null 不占位。
  * 「拒 / 满」这些态没有百分比，此时返回 `note` 走文案而不是画满格条——
  * 满格红条在一个 5h/7d 都是 0% 的号上会被误读成「烧满了」，
  * 而实际含义是「这个号根本用不了 Fable」。
  */
 export function fableRow(vm: Vm): FableRow | null {
-  const tier = claudeTier(vm)
-  if (tier.key === 'none' || tier.key === 'codex') return null
-  // 没有 Fable 权限的号不占行：有则显示，没有就不显示。
+  if (!vm.has_token || isCodexVm(vm)) return null
   if (fablePlanDenied(vm.fable)) return null
-  const st = fableState(vm, tier.key)
+  const st = fableState(vm)
   if (st.usedPct != null) return { kind: 'bar', pct: st.usedPct }
-  if (st.tone.key === 'none') return { kind: 'bar', pct: null }
   return { kind: 'note', text: st.tone.text }
 }

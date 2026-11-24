@@ -2,6 +2,7 @@ import type { UsageAccountRow } from '@/types/panel-usage'
 import type { Vm } from '@/types/panel-vm'
 import { usedPctOf } from '@/lib/format'
 import { windowProbed } from '@/lib/pool-quota'
+import { isCodexVm } from '@/lib/vm-kind'
 import { fleetGroup, type FleetGroup } from '@/lib/vm-status'
 import { vmCostLedger, type VmLedgerRow } from '@/lib/vm-usage'
 import { fableRow } from '@/features/vm/usage-meter'
@@ -11,7 +12,15 @@ import { fableRow } from '@/features/vm/usage-meter'
  * `bad`、`revoke` 与其余「不可调度」合成一区：都要人工处理后再调度开，
  * 分开只会让运维多扫一段。
  */
-export type VmZone = 'pool' | 'restricted' | 'off' | 'none' | 'dead'
+export type VmZone =
+  | 'pool'
+  | 'host_verified'
+  | 'pending'
+  | 'host_failed'
+  | 'restricted'
+  | 'off'
+  | 'none'
+  | 'dead'
 export type VmZoneFilter = VmZone | 'all'
 
 export type ZoneDef = {
@@ -23,6 +32,30 @@ export type ZoneDef = {
   color: string
 }
 
+export const GEMINI_EVIDENCE_ZONES = [
+  {
+    key: 'host_verified',
+    label: '宿主推理成功',
+    hint: '最近一次宿主推理成功，不代表公共 API 端到端验证',
+    tone: 'ok',
+    color: 'var(--status-ok-solid)',
+  },
+  {
+    key: 'pending',
+    label: '待验证',
+    hint: '授权中，或候选条件已满足但未观察到宿主推理成功',
+    tone: 'none',
+    color: 'var(--status-none)',
+  },
+  {
+    key: 'host_failed',
+    label: '宿主推理失败',
+    hint: '最近一次宿主推理失败，不代表已配置凭证失效',
+    tone: 'warn',
+    color: 'var(--status-warn-solid)',
+  },
+] as const satisfies readonly ZoneDef[]
+
 export const ZONES: readonly ZoneDef[] = [
   {
     key: 'pool',
@@ -31,6 +64,7 @@ export const ZONES: readonly ZoneDef[] = [
     tone: 'ok',
     color: 'var(--status-ok-solid)',
   },
+  ...GEMINI_EVIDENCE_ZONES,
   {
     key: 'restricted',
     label: '受限',
@@ -71,14 +105,21 @@ export function zoneOf(vm: Vm): VmZone {
   return zoneOfGroup(fleetGroup(vm))
 }
 
-export function zoneCounts(vms: Vm[]): Record<VmZone, number> {
-  const c: Record<VmZone, number> = {
+export function emptyZoneCounts(): Record<VmZone, number> {
+  return {
     pool: 0,
     restricted: 0,
     off: 0,
     none: 0,
     dead: 0,
+    host_verified: 0,
+    pending: 0,
+    host_failed: 0,
   }
+}
+
+export function zoneCounts(vms: Vm[]): Record<VmZone, number> {
+  const c = emptyZoneCounts()
   for (const vm of vms) c[zoneOf(vm)] += 1
   return c
 }
@@ -97,7 +138,7 @@ export type WindowReadout = {
   reset: unknown
 }
 
-/** 5H → 7D → Fable。有凭证的 Claude 槽都带 Fable 行（任意订阅档），未探测画「—」。 */
+/** 5H → 7D → Fable；无读数的 Fable 窗口展示探测状态。 */
 export function vmWindows(vm: Vm): WindowReadout[] {
   const probed = (w: '5h' | '7d') =>
     vm.has_token && windowProbed(vm, w) ? usedPctOf(vm, w) : null
@@ -214,11 +255,15 @@ export function rackTotals(
       bad: 0,
       revoke: 0,
       unschedulable: 0,
+      host_verified: 0,
+      pending: 0,
+      host_failed: 0,
     },
     seatsUsed: 0,
     seatsMax: 0,
     ledger: [],
   }
+  const seenAccounts = new Set<string>()
   for (const vm of vms) {
     t.groups[fleetGroup(vm)] += 1
     if (vm.seats_max != null) {
@@ -226,13 +271,22 @@ export function rackTotals(
       t.seatsMax += Number(vm.seats_max) || 0
     }
     const rows = vmCostLedger(vm, accounts)
+    const accountKey = isCodexVm(vm)
+      ? `openai:${vm.org_uuid || vm.id}`
+      : vm.account_uuid || vm.id
+    const countTotal = !vm.lifetime_usage || !seenAccounts.has(accountKey)
+    if (vm.lifetime_usage) seenAccounts.add(accountKey)
+    const mixed = rows.map(({ note: _note, ...r }) =>
+      r.key === 'total' ? { ...r, label: '总费用' } : r
+    )
     t.ledger = t.ledger.length
       ? t.ledger.map((r, i) => ({
           ...r,
-          cost: r.cost + rows[i].cost,
-          tokens: r.tokens + rows[i].tokens,
+          cost: r.cost + (r.key === 'total' && !countTotal ? 0 : mixed[i].cost),
+          tokens:
+            r.tokens + (r.key === 'total' && !countTotal ? 0 : mixed[i].tokens),
         }))
-      : rows
+      : mixed
   }
   return t
 }

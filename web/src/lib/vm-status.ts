@@ -1,6 +1,7 @@
 import type { Vm } from '@/types/panel-vm'
 import type { StatusTone } from '@/types/status'
 import { pct } from '@/lib/format'
+import { geminiAccountStatus } from '@/lib/gemini-account-status'
 import { isCodexVm } from '@/lib/vm-kind'
 
 function credTextOf(vm: Vm): { text: string; key: string; tone: string } {
@@ -284,12 +285,36 @@ export function seatTitle(vm: Vm): string {
             : seat.state === 'held'
               ? '交接'
               : '占用'
-        return `#${Number(seat.index)} ${short || '—'} ${state}`
+        const children =
+          seat.subagents_max == null
+            ? ''
+            : ` 子代理 ${seat.subagents_running ?? 0}/${seat.subagents_max} 排队 ${seat.subagents_queued ?? 0}`
+        return `#${Number(seat.index)} ${short || '—'} ${state}${children}`
       })
     parts.push(labels.join(' · '))
   }
   if (queued) parts.push(`排队 ${queued}${conc ? `（等并发 ${conc}）` : ''}`)
   return parts.join(' · ')
+}
+
+/**
+ * 这台 VM 正在处理的请求数。
+ * 有逐席 session 时只加总正在请求的席位（`active`，或 `inflight > 0`）。
+ * 重启交接的 `held` 不算。`inflight` 为 0 但状态已是 active 时记 1。
+ * 没有逐席明细（Codex）才回退 VM 级 `inflight`。
+ * `session_active` 是空闲对话窗口，不能当成请求中。
+ */
+export function vmRequestingCount(
+  vm: Pick<Vm, 'seat_sessions' | 'inflight'>
+): number {
+  if (!Array.isArray(vm.seat_sessions)) return Number(vm.inflight) || 0
+  let total = 0
+  for (const seat of vm.seat_sessions) {
+    const inflight = Number(seat.inflight) || 0
+    if (inflight > 0) total += inflight
+    else if (seat.state === 'active') total += 1
+  }
+  return total
 }
 
 export function vmCooldownTitle(vm: Vm): string {
@@ -301,6 +326,8 @@ export function vmCooldownTitle(vm: Vm): string {
 }
 
 export function accountStatus(vm: Vm | undefined): StatusTone {
+  if (vm?.gemini)
+    return geminiAccountStatus(vm.gemini, vm.unschedulable_text).tone
   if (parkedGrantDeath(vm) || vmRevoked(vm)) return invalidCredTone(vm)
   const unschedulable = unschedulableTone(vm)
   if (unschedulable) return { ...unschedulable, label: unschedulable.text }
@@ -427,6 +454,7 @@ export function accountStatus(vm: Vm | undefined): StatusTone {
  * `accountStatus` 的 revoke 分支截走了，不会走到这里。
  */
 export function credentialStatus(vm: Vm | undefined): StatusTone {
+  if (vm?.gemini) return geminiAccountStatus(vm.gemini).authorization
   const base = accountStatus(vm)
   // 休息时段同理是调度意图（排班），不是凭证状态。
   if (base.key !== 'off' && base.key !== 'rest') return base
@@ -531,6 +559,15 @@ function restrictionTone(vm: Vm | undefined): StatusTone | null {
         cls: 'bad',
       }
     }
+    // 内核故障（自动恢复预算耗尽）不是额度问题：用红色与「额度限制」区分，
+    // 提示运维去详情页诊断，而不是等窗口重置。
+    if (/^kernel_faulted$/.test(reason)) {
+      return {
+        key: 'kernel_fault',
+        text: restrictionLabel(vm, '内核故障'),
+        cls: 'bad',
+      }
+    }
     // 休息时段是操作员排班，不是上游冷却：单独成态，别引人去点「清冷却」。
     if (vm.availability?.key === 'rest' || /rest_period/.test(reason)) {
       return {
@@ -572,6 +609,8 @@ function seatsFullTone(vm: Vm | undefined): StatusTone | null {
  * 受限、不可调度与调度关互斥（后端先判调度关）。
  */
 export function poolStatus(vm: Vm | undefined): StatusTone {
+  if (vm?.gemini)
+    return geminiAccountStatus(vm.gemini, vm.unschedulable_text).tone
   // 吊销 / 废票先判：它可能同时带着 off / quota 的 availability.key，照 key
   // 判会显示成「调度关」，把真正的死因盖掉。
   if (parkedGrantDeath(vm) || vmRevoked(vm)) return invalidCredTone(vm)
@@ -662,6 +701,8 @@ export function poolStatus(vm: Vm | undefined): StatusTone {
  * 完整判定链（revoke 先于一切）。号池额度卡与本口径共用同一谓词。
  */
 export function accountUsable(vm: Vm | undefined): boolean {
+  // Gemini host evidence does not establish generic pool availability.
+  if (vm?.gemini) return false
   return Boolean(vm?.has_token) && credentialStatus(vm).cls !== 'bad'
 }
 
@@ -722,9 +763,24 @@ export function claudeTier(vm: Vm | undefined): StatusTone {
   }
   if (!vm?.has_token) return { key: 'none', label: '—', cls: 'none', text: '—' }
   // Legacy account_tier may come from Fable usage or a default Pro policy.
-  const raw = String(vm.subscription_type || '')
+  let raw = String(vm.subscription_type || '')
     .trim()
     .toLowerCase()
+  const profileTier = String(vm.account_tier || '')
+    .trim()
+    .toLowerCase()
+  if (
+    vm.account_tier_source === 'profile' &&
+    (profileTier === 'pro' || profileTier === 'max')
+  ) {
+    raw = profileTier
+  } else if (
+    (!raw || raw === 'free' || raw === 'pro') &&
+    /(?:^|_)claude_max(?:_|$)/i.test(String(vm.rate_limit_tier || ''))
+  ) {
+    // Imported credentials may carry a default Pro subscription.
+    raw = 'max'
+  }
   const labels: Record<string, string> = {
     free: 'Free',
     pro: 'Pro',
@@ -765,10 +821,21 @@ export function vmBuckets(vms: Vm[]) {
 }
 
 export type FleetGroup =
-  'pool' | 'restricted' | 'off' | 'none' | 'bad' | 'revoke' | 'unschedulable'
+  | 'pool'
+  | 'restricted'
+  | 'off'
+  | 'none'
+  | 'bad'
+  | 'revoke'
+  | 'unschedulable'
+  | 'pending'
+  | 'host_failed'
+  | 'host_verified'
 
 /** Coarse fleet grouping for the VM list. 受限 is the triad, not 5h/7d warning. */
 export function fleetGroup(vm: Vm): FleetGroup {
+  if (vm.gemini)
+    return geminiAccountStatus(vm.gemini, vm.unschedulable_text).group
   const status = poolStatus(vm)
   const k = status.key
   if (k === 'revoke') return 'revoke'
@@ -793,6 +860,9 @@ export function fleetCounts(vms: Vm[]): Record<FleetGroup | 'all', number> {
     bad: 0,
     revoke: 0,
     unschedulable: 0,
+    pending: 0,
+    host_failed: 0,
+    host_verified: 0,
   }
   for (const vm of vms) c[fleetGroup(vm)] += 1
   return c
@@ -805,6 +875,7 @@ export function fleetCounts(vms: Vm[]): Record<FleetGroup | 'all', number> {
  * 都得沉到列表底部，不该混在还能用的槽位中间。
  */
 export function vmCredDead(vm: Vm): boolean {
+  if (vm.gemini) return vm.gemini.auth_state === 'reauth_required'
   const g = fleetGroup(vm)
   return g === 'bad' || g === 'revoke' || g === 'unschedulable'
 }
@@ -817,6 +888,10 @@ export function vmCredDead(vm: Vm): boolean {
  * 谁更新谁代表这台槽最后一次「有动静」。都没有则回 0，排到本组最后。
  */
 export function vmFailedAt(vm: Vm): number {
+  // 已记录失效时刻（吊销/不可调度）就用它；否则 last_probe 每次探测都会刷新，
+  // 死号会一直显示「刚刚」。
+  const recorded = Date.parse(String(vm.unschedulable_at || ''))
+  if (Number.isFinite(recorded)) return recorded
   const stamps: unknown[] = [
     vm.last_probe?.at,
     vm.refreshed_at,

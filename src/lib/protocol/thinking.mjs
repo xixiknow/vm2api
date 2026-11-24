@@ -5,13 +5,18 @@ import { BETA_THINKING_DISPLAY_UPDATES } from './claude-code-betas.mjs'
 import {
   normalizeThinkingByPolicy,
   getCapabilities,
+  getModelEntry,
   getModelParams,
+  hasForcedToolChoice,
+  requiredAdaptiveThinking,
+  canRepairAdaptiveThinking,
   clampEnabledThinkingBudget,
+  resolvePlatformThinkingBudget,
   MIN_THINKING_BUDGET,
 } from './model-policy.mjs'
 import { anthropicContentIsEmpty, mergeConsecutiveAnthropicMessages, messageHasTurnControls } from './sanitize.mjs'
 
-export { clampEnabledThinkingBudget, MIN_THINKING_BUDGET }
+export { canRepairAdaptiveThinking, clampEnabledThinkingBudget, resolvePlatformThinkingBudget, MIN_THINKING_BUDGET }
 
 /** `routing.compatibility.thinking_display`：缺省 summarized，显式 passthrough 才保留调用方的值。 */
 export const THINKING_DISPLAY_MODES = ['summarized', 'passthrough']
@@ -28,7 +33,7 @@ export function thinkingDisplayMode(routing) {
  * Official (Aug 2026):
  *   Adaptive: Opus 4.6+, Sonnet 4.6+, Opus 4.7/4.8/5, Sonnet 5, Fable 5, Mythos
  *   Manual enabled+budget only: Haiku 4.5, Sonnet/Opus 4.5 and earlier
- *   OAuth (sub2api): Claude 5 / Fable / Opus 4.7+ keep thinking.enabled as-is.
+ *   OAuth: Claude 5 / Fable / Opus 4.7+ keep thinking.enabled as-is.
  * Client RikkaHub etc. send adaptive even on Haiku -> 400; convert only there.
  */
 
@@ -106,7 +111,8 @@ export function normalizeThinkingForModel(body = {}) {
   // Prefer model-policy matrix; fall back to hardcoded heuristics if policy unavailable
   try {
     return normalizeThinkingByPolicy(body)
-  } catch {
+  } catch (error) {
+    if (error?.code === 'thinking_incompatible') throw error
     /* fall through */
   }
   if (!body || typeof body !== 'object') return body
@@ -116,7 +122,11 @@ export function normalizeThinkingForModel(body = {}) {
   const type = String(thinking.type || '').toLowerCase()
 
   if (type === 'adaptive' && !modelSupportsAdaptiveThinking(model)) {
-    const budget = Number(thinking.budget_tokens) > 0 ? Number(thinking.budget_tokens) : DEFAULT_FALLBACK_BUDGET
+    const explicitBudget = Number(thinking.budget_tokens)
+    const budget =
+      Number.isFinite(explicitBudget) && explicitBudget > 0
+        ? explicitBudget
+        : resolvePlatformThinkingBudget(body, DEFAULT_FALLBACK_BUDGET)
     body.thinking = { type: 'enabled', budget_tokens: budget }
     return clampEnabledThinkingBudget(body)
   }
@@ -194,25 +204,31 @@ function thinkingNeedsOfficialDisplay(thinking) {
   return display == null || String(display).trim() === ''
 }
 
-function forcedToolChoice(body) {
-  const type = String(body?.tool_choice?.type || '').toLowerCase()
-  return type === 'tool' || type === 'any'
+function supportsAdaptiveDefault(model) {
+  const entry = getModelEntry(model)
+  return entry._heuristic ? modelSupportsAdaptiveThinking(model) : entry.capabilities.supports_adaptive === true
 }
 
 /** Official 2.1.241 unofficial fill: missing thinking → adaptive+omitted; missing display only → omitted. Never overwrite caller display. Forced tool_choice cannot carry adaptive thinking, so a third-party omit stays omitted. */
 export function ensureUnofficialAdaptiveThinking(body = {}) {
   if (!body || typeof body !== 'object') return body
   if (body.thinking == null) {
-    if (!modelSupportsAdaptiveThinking(body.model) || forcedToolChoice(body)) return body
+    if (hasForcedToolChoice(body) || !supportsAdaptiveDefault(body.model)) return body
     return { ...body, thinking: { type: 'adaptive', display: OFFICIAL_THINKING_DISPLAY } }
   }
   if (!thinkingNeedsOfficialDisplay(body.thinking)) return body
   return { ...body, thinking: { ...body.thinking, display: OFFICIAL_THINKING_DISPLAY } }
 }
-/** Official fill: missing thinking becomes adaptive. `cli` uses `updates`; `sdk-cli` uses `omitted`. Caller thinking is left alone. */
+/** Native fill must be explicit because the CLI supplies its own default for omitted thinking. */
 export function ensureOfficialPrintThinking(body = {}, entrypoint = 'sdk-cli') {
-  if (!body || typeof body !== 'object' || body.thinking != null) return body
-  if (!modelSupportsAdaptiveThinking(body.model)) return body
+  if (!body || typeof body !== 'object') return body
+  const required = requiredAdaptiveThinking(body)
+  if (required) return { ...body, thinking: { display: officialThinkingDisplay(entrypoint), ...required } }
+  if (body.thinking != null) return body
+  if (hasForcedToolChoice(body)) {
+    return getCapabilities(body.model).requires_adaptive === true ? body : { ...body, thinking: { type: 'disabled' } }
+  }
+  if (!supportsAdaptiveDefault(body.model)) return body
   return { ...body, thinking: { type: 'adaptive', display: officialThinkingDisplay(entrypoint) } }
 }
 
@@ -301,8 +317,10 @@ const CATALOG_EFFORT = [
   ['opus-4-8', 'high'],
   ['opus-4-7', 'xhigh'],
   ['opus-4-6', 'xhigh'],
+  ['fable-5-2', 'medium'],
   ['fable-5-1', 'high'],
   ['fable-5', 'high'],
+  ['mythos-5-2', 'medium'],
   ['mythos-5-1', 'high'],
 ]
 

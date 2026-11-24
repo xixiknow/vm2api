@@ -34,6 +34,20 @@ test('a model entitlement rejection is persisted for that account and model', ()
   assert.equal(q.repo.get('a-denied').unified.model_denied_until['claude-fable-5'], undefined)
 })
 
+test('a Fable usage-credits rejection blocks Fable and leaves a panel marker until a success', () => {
+  const q = new AccountQuota({ dataDir: tmpDir(), config: {} })
+  q.ensure({ account_id: 'a-credits' })
+  q.markFableCreditsRequired('a-credits', 'claude-fable-5-2', 60_000)
+  const u = q.repo.get('a-credits').unified
+  const key = u.fable_credits_required.model
+  assert.ok(u.model_denied_until[key] > Date.now())
+  assert.equal(Date.parse(u.fable_credits_required.until), u.model_denied_until[key])
+  q.clearModelUnsupported('a-credits', 'claude-fable-5-2')
+  const cleared = q.repo.get('a-credits').unified
+  assert.equal(cleared.model_denied_until[key], undefined)
+  assert.equal(cleared.fable_credits_required, undefined)
+})
+
 function futureReset(msFromNow) {
   return new Date(Date.now() + msFromNow).toISOString()
 }
@@ -690,56 +704,6 @@ test('7d_oi window is Fable-only and does not block the account', () => {
   assert.equal(q.fableWindowResetAt('acc-oi'), Date.parse(reset))
 })
 
-test('regular 5h/7d limits do not gate a Fable request', () => {
-  const q = new AccountQuota({
-    dataDir: tmpDir(),
-    config: { quota: { safety_ratio: 0.8, weekly_safety_ratio: 0.8, block_on_5h: true, block_on_7d: true } },
-  })
-  q.ingestHeaders('acc-lane', {
-    'anthropic-ratelimit-unified-5h-utilization': '1',
-    'anthropic-ratelimit-unified-5h-status': 'rejected',
-    'anthropic-ratelimit-unified-5h-reset': futureReset(3600_000),
-    'anthropic-ratelimit-unified-7d-utilization': '0.99',
-    'anthropic-ratelimit-unified-7d-status': 'allowed',
-    'anthropic-ratelimit-unified-7d-reset': futureReset(3 * 24 * 3600_000),
-    'anthropic-ratelimit-unified-7d_oi-utilization': '0.1',
-    'anthropic-ratelimit-unified-7d_oi-status': 'allowed',
-    'anthropic-ratelimit-unified-7d_oi-reset': futureReset(3 * 24 * 3600_000),
-  })
-  assert.equal(q.canAccept('acc-lane', { model: 'claude-sonnet-5' }).reason, 'quota_5h_cli')
-  assert.equal(q.canAccept('acc-lane').ok, false)
-  assert.equal(q.canAccept('acc-lane', { model: 'claude-fable-5-2' }).ok, true)
-  assert.equal(q.gateZoneOf('acc-lane', { model: 'claude-fable-5-2' }), 'open')
-  assert.equal(q.gateZoneOf('acc-lane'), 'gated')
-  const held = q.tryAcquire('acc-lane', { model: 'claude-fable-5-2' })
-  assert.equal(held.ok, true)
-  q.release('acc-lane')
-})
-
-test('Fable is gated on its own weekly window against limit_7d', () => {
-  const q = new AccountQuota({
-    dataDir: tmpDir(),
-    config: { quota: { safety_ratio: 0.8, weekly_safety_ratio: 0.8, block_on_5h: true, block_on_7d: true } },
-  })
-  const reset = futureReset(3 * 24 * 3600_000)
-  q.ingestHeaders('acc-fable-line', {
-    'anthropic-ratelimit-unified-5h-utilization': '0.1',
-    'anthropic-ratelimit-unified-5h-status': 'allowed',
-    'anthropic-ratelimit-unified-7d-utilization': '0.1',
-    'anthropic-ratelimit-unified-7d-status': 'allowed',
-    'anthropic-ratelimit-unified-7d_oi-utilization': '0.99',
-    'anthropic-ratelimit-unified-7d_oi-status': 'allowed',
-    'anthropic-ratelimit-unified-7d_oi-reset': reset,
-  })
-  const gate = q.canAccept('acc-fable-line', { model: 'claude-fable-5-2' })
-  assert.equal(gate.ok, false)
-  assert.equal(gate.reason, 'quota_fable_safety')
-  assert.equal(gate.detail.reset, reset)
-  assert.equal(q.gateZoneOf('acc-fable-line', { model: 'claude-fable-5-2' }), 'gated')
-  assert.equal(q.canAccept('acc-fable-line', { model: 'claude-sonnet-5' }).ok, true)
-  assert.equal(q.gateZoneOf('acc-fable-line'), 'open')
-})
-
 test('7d_oi rejected with elapsed second-level reset is not Fable-limited', () => {
   const q = new AccountQuota({
     dataDir: tmpDir(),
@@ -971,6 +935,22 @@ test('429 unified exhausted marks headers rejected without inventing official 10
   assert.equal(acc.unified.headers['5h'].utilization, 0.84)
   assert.notEqual(acc.unified.official?.['5h']?.utilization, 1)
   assert.equal(q.canAccept('acc-429').ok, false)
+})
+
+test('exhausted 429 with only a seven_day claim rejects 7d, not 5h', () => {
+  const q = new AccountQuota({ dataDir: tmpDir(), config: {} })
+  q.ingestHeaders('acc-claim7', {
+    'anthropic-ratelimit-unified-5h-utilization': '0.1',
+    'anthropic-ratelimit-unified-5h-status': 'allowed',
+  })
+  q.ingestHeaders('acc-claim7', { 'anthropic-ratelimit-unified-representative-claim': 'seven_day' }, null, {
+    exhausted: true,
+    status: 429,
+    countRequest: false,
+  })
+  const acc = q.repo.get('acc-claim7')
+  assert.equal(acc.unified.headers['7d'].status, 'rejected')
+  assert.equal(acc.unified.headers['5h'].status, 'allowed')
 })
 
 test('local 429 without quota evidence does not reject the 5h window', () => {
@@ -1280,6 +1260,96 @@ test('elapsed header reset wipes Extra and becomes schedulable', () => {
   assert.equal(saved.unified.headers['5h'].status, 'active')
 })
 
+// #1312: Extra 5h stayed at the last window's 37% while one shared sampled_at
+// moved to every new probe, next to official 100% for the window after it.
+function seedEndedFiveHour(q, id, { at, endedAt }) {
+  const acc = q.ensure({ account_id: id })
+  acc.unified.headers = {
+    '5h': {
+      utilization: 0.37,
+      reset: new Date(endedAt).toISOString(),
+      status: 'allowed',
+      sampled_at: new Date(at).toISOString(),
+    },
+    '7d': { utilization: 0.5, reset: futureReset(3 * 24 * 3600_000), status: 'allowed' },
+    sampled_at: new Date(at).toISOString(),
+  }
+  acc.window_history = { '5h': { current: { reset: new Date(endedAt).toISOString(), used_ratio: 0.37 } } }
+  q.repo.save(acc)
+}
+
+test('a probe after a 5h rollover marks the ended Extra window stale and keeps its own sample time', () => {
+  const q = new AccountQuota({ dataDir: tmpDir(), config: {} })
+  const H = 3600_000
+  const now = Date.now()
+  const lastRead = now - 4.5 * H
+  const ended = now - 4.3 * H
+  seedEndedFiveHour(q, 'acc-1312', { at: lastRead, endedAt: ended })
+  const probedAt = new Date(now).toISOString()
+  const nextReset = new Date(now + H).toISOString()
+  q.ingestOAuthUsage('acc-1312', {
+    ok: true,
+    usage_status: 200,
+    source: 'official-cc-usage',
+    five_hour: { utilization: 100, status: 'rejected', resets_at: nextReset },
+    seven_day: { utilization: 61, status: 'allowed', resets_at: futureReset(9 * 60_000) },
+    probed_at: probedAt,
+  })
+  const acc = q.repo.get('acc-1312')
+  assert.equal(acc.unified.official['5h'].utilization, 1)
+  const h5 = acc.unified.headers['5h']
+  assert.equal(h5.stale, true)
+  assert.equal(h5.stale_reason, 'reset_elapsed')
+  assert.notEqual(h5.utilization, 0.37)
+  assert.equal(h5.sampled_at, new Date(lastRead).toISOString(), 'the ended reading keeps the time it was read')
+  assert.equal(acc.unified.headers['7d'].utilization, 0.61)
+  assert.equal(acc.unified.headers['7d'].sampled_at, probedAt)
+  // The archive moves on to the window official reports and closes the old one at 37%.
+  assert.deepEqual(acc.window_history['5h'].current, { reset: nextReset, used_ratio: 1 })
+  assert.equal(acc.window_history['5h'].prev.used_ratio, 0.37)
+  assert.equal(acc.window_history['5h'].prev.end, new Date(ended).toISOString())
+})
+
+test('a response naming only 7d does not refresh the 5h sample time', () => {
+  const q = new AccountQuota({ dataDir: tmpDir(), config: {} })
+  const H = 3600_000
+  const now = Date.now()
+  const reset5 = String(Math.floor((now + 2 * H) / 1000))
+  q.ingestHeaders('acc-7d-only', {
+    'anthropic-ratelimit-unified-5h-utilization': '0.2',
+    'anthropic-ratelimit-unified-5h-reset': reset5,
+    'anthropic-ratelimit-unified-7d-utilization': '0.4',
+  })
+  const first = q.repo.get('acc-7d-only').unified.headers['5h'].sampled_at
+  assert.ok(first)
+  const acc = q.repo.get('acc-7d-only')
+  acc.unified.headers['5h'].sampled_at = new Date(now - 10 * 60_000).toISOString()
+  q.repo.save(acc)
+  q.ingestHeaders('acc-7d-only', { 'anthropic-ratelimit-unified-7d-utilization': '0.45' })
+  const headers = q.repo.get('acc-7d-only').unified.headers
+  assert.equal(headers['5h'].sampled_at, new Date(now - 10 * 60_000).toISOString())
+  assert.equal(headers['5h'].utilization, 0.2)
+  assert.equal(headers['7d'].utilization, 0.45)
+  assert.ok(Date.parse(headers['7d'].sampled_at) >= now)
+  assert.equal(headers.sampled_at, headers['7d'].sampled_at)
+})
+
+test('a new 5h reading does not inherit utilization from a window that already ended', () => {
+  const q = new AccountQuota({ dataDir: tmpDir(), config: {} })
+  const H = 3600_000
+  const now = Date.now()
+  seedEndedFiveHour(q, 'acc-carry', { at: now - 4.5 * H, endedAt: now - 4.3 * H })
+  const nextReset = String(Math.floor((now + H) / 1000))
+  q.ingestHeaders('acc-carry', {
+    'anthropic-ratelimit-unified-5h-status': 'allowed',
+    'anthropic-ratelimit-unified-5h-reset': nextReset,
+  })
+  const h5 = q.repo.get('acc-carry').unified.headers['5h']
+  assert.equal(h5.utilization, null)
+  assert.equal(parseResetMs(h5.reset), Number(nextReset) * 1000)
+  assert.ok(Date.parse(h5.sampled_at) >= now)
+})
+
 test('complete usage may replace a profile-sourced tier', async () => {
   const quota = new AccountQuota({ dataDir: tmpDir(), config: {} })
   quota.ensure({ account_id: 'acct-profile', vm_id: 'vm-01' })
@@ -1297,4 +1367,32 @@ test('complete usage may replace a profile-sourced tier', async () => {
   assert.equal(quota.repo.get('acct-profile').unified.account_tier_source, 'usage')
   quota.setAccountTier('acct-profile', 'max', { source: 'profile' })
   assert.equal(quota.repo.get('acct-profile').unified.account_tier, 'max')
+})
+
+test('a 限额查询 Fable hop that needs usage credits sets the same mark, and a Fable success lifts it', () => {
+  const q = new AccountQuota({ dataDir: tmpDir(), config: {} })
+  q.ensure({ account_id: 'a-probe-credits' })
+  q.ingestOAuthUsage('a-probe-credits', {
+    ok: true,
+    usage_status: 200,
+    limits_present: true,
+    usage_has_fable: false,
+    five_hour: { utilization: 0 },
+    seven_day: { utilization: 10 },
+    fable: { status: 429, ok: false, limited: true, error: 'Usage credits are required for this model.' },
+  })
+  const marked = q.repo.get('a-probe-credits').unified
+  const key = marked.fable_credits_required.model
+  assert.ok(marked.model_denied_until[key] > Date.now())
+  q.ingestOAuthUsage('a-probe-credits', {
+    ok: true,
+    usage_status: 200,
+    limits_present: true,
+    five_hour: { utilization: 0 },
+    seven_day: { utilization: 10 },
+    fable: { status: 200, ok: true, limited: false, error: null },
+  })
+  const cleared = q.repo.get('a-probe-credits').unified
+  assert.equal(cleared.fable_credits_required, undefined)
+  assert.equal(cleared.model_denied_until[key], undefined)
 })

@@ -286,7 +286,6 @@ export async function startClaudeSetupTokenSession({ vm, projectRoot, force = fa
       'KIN_SETUP_TOKEN=1',
       'CLAUDE_CODE_USE_BEDROCK=0',
       'CLAUDE_CODE_USE_VERTEX=0',
-      'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=0',
       'DISABLE_TELEMETRY=1',
       'DO_NOT_TRACK=1',
       'ANTHROPIC_BASE_URL=',
