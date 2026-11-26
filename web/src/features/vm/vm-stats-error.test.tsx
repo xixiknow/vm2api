@@ -6,6 +6,10 @@ import { VmStatsDialog } from './vm-stats-dialog'
 const state = { isLoading: false, isError: false, data: undefined as unknown }
 vi.mock('./queries', () => ({
   vmQueryOptions: () => ({ queryKey: ['vm'], queryFn: async () => state.data }),
+  vmStatsDetailQueryOptions: () => ({
+    queryKey: ['vm'],
+    queryFn: async () => state.data,
+  }),
 }))
 vi.mock('@tanstack/react-query', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@tanstack/react-query')>()

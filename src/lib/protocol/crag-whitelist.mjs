@@ -9,6 +9,7 @@
  */
 import { CRS_OFFICIAL_CLI_SYSTEM } from '../identity/crs-persona.mjs'
 import { materializeAutomaticCache } from './cache-ttl.mjs'
+import { isEmptyEffortValue } from './log-fields.mjs'
 import { normalizeToolInputSchemas } from './tool-input-schema.mjs'
 
 const BILLING_LINE_RE = /^x-anthropic-billing-header:/i
@@ -42,6 +43,7 @@ export const CRAG_CAPABILITY_GATED_TOP_KEYS = Object.freeze(
     ['safeguards', 'request_safeguards'],
     ['speed', 'request_speed'],
     ['thread', 'message_threads_beta'],
+    ['service_tier', 'request_service_tier'],
   ]),
 )
 
@@ -55,7 +57,6 @@ export const CRAG_SILENT_STRIP_TOP_KEYS = Object.freeze(
     'betas',
     'diagnostics',
     'auto_compact_window',
-    'service_tier',
     'fallbacks',
     'fallback_credit_token',
     'caller_cwd',
@@ -134,14 +135,20 @@ function isPlainObject(value) {
   return value != null && typeof value === 'object' && !Array.isArray(value)
 }
 
-function invalid(param, reason, code = 'invalid_kernel_request') {
+function invalid(param, reason, code = 'invalid_kernel_request', details = null) {
   const message = `${param}: ${reason}`
   const error = new Error(message)
   error.status = 400
   error.code = code
   error.body = {
     type: 'error',
-    error: { type: 'invalid_request_error', code, message, param, details: { retryable: false } },
+    error: {
+      type: 'invalid_request_error',
+      code,
+      message,
+      param,
+      details: { retryable: false, ...(details || {}) },
+    },
   }
   throw error
 }
@@ -152,6 +159,12 @@ function pickKeys(source, allowedSet) {
     if (Object.hasOwn(source, key) && source[key] !== undefined) out[key] = source[key]
   }
   return out
+}
+
+function pickOutputConfig(source) {
+  const cfg = pickKeys(source, OUTPUT_CONFIG_KEYS)
+  if (Object.hasOwn(cfg, 'effort') && isEmptyEffortValue(cfg.effort)) delete cfg.effort
+  return Object.keys(cfg).length ? cfg : undefined
 }
 
 function hasOnlyAllowedKeys(source, allowedSet) {
@@ -284,6 +297,14 @@ function isCleanMessages(messages) {
   for (const message of messages) {
     if (!isPlainObject(message) || !hasOnlyAllowedKeys(message, MESSAGE_ALLOWED_KEYS)) return false
     if (!['user', 'assistant', 'system'].includes(message.role)) return false
+    if (message.output_config != null) {
+      if (!isPlainObject(message.output_config) || !hasOnlyAllowedKeys(message.output_config, OUTPUT_CONFIG_KEYS)) {
+        return false
+      }
+      if (Object.hasOwn(message.output_config, 'effort') && isEmptyEffortValue(message.output_config.effort)) {
+        return false
+      }
+    }
     if (typeof message.content === 'string') continue
     if (!Array.isArray(message.content)) return false
     if (!message.content.every(isCleanBlock)) return false
@@ -393,7 +414,8 @@ function sanitizeMessages(messages, { preserveCanonicalHistory = false } = {}) {
       invalid(`${param}.content`, 'must be text or an array of content blocks')
     }
     if (message.output_config != null && isPlainObject(message.output_config)) {
-      out.output_config = pickKeys(message.output_config, OUTPUT_CONFIG_KEYS)
+      const cfg = pickOutputConfig(message.output_config)
+      if (cfg) out.output_config = cfg
     }
     if (message.clear_at != null) out.clear_at = message.clear_at
     return out
@@ -658,8 +680,8 @@ export function sanitizeCragBodyWhitelist(
 
   if (materialized.output_config != null) {
     if (!isPlainObject(materialized.output_config)) invalid('output_config', 'must be an object')
-    const cfg = pickKeys(materialized.output_config, OUTPUT_CONFIG_KEYS)
-    if (Object.keys(cfg).length) out.output_config = cfg
+    const cfg = pickOutputConfig(materialized.output_config)
+    if (cfg) out.output_config = cfg
   }
 
   if (materialized.context_management != null) {
@@ -700,9 +722,41 @@ export function sanitizeCragBodyWhitelist(
     }
   }
 
+  if (materialized.service_tier != null) {
+    if (materialized.service_tier !== 'auto' && materialized.service_tier !== 'standard_only') {
+      invalid('service_tier', 'must be "auto" or "standard_only"')
+    }
+    if (caps?.includes('request_service_tier')) {
+      out.service_tier = materialized.service_tier
+    } else if (materialized.service_tier === 'auto') {
+      strippedFields.push('service_tier')
+    } else {
+      invalid(
+        'service_tier',
+        'service_tier="standard_only" is not supported on the Claude VM / CRAG execution path; omit service_tier or use "auto" if default capacity is acceptable',
+        'unsupported_capability',
+        { field: 'service_tier', value: materialized.service_tier, execution_path: 'crag' },
+      )
+    }
+  }
+
   // Controlled CRAG internal fields
   for (const key of CRAG_INTERNAL_ALLOWED_TOP_KEYS) {
-    if (materialized[key] !== undefined) out[key] = materialized[key]
+    const value = materialized[key]
+    if (value === undefined) continue
+    if (key === 'effort' && isEmptyEffortValue(value)) continue
+    if (
+      key === 'crag_options' &&
+      isPlainObject(value) &&
+      Object.hasOwn(value, 'effort') &&
+      isEmptyEffortValue(value.effort)
+    ) {
+      const next = { ...value }
+      delete next.effort
+      if (Object.keys(next).length) out[key] = next
+      continue
+    }
+    out[key] = value
   }
 
   if (validateCacheBudget) validateBreakpointOrderAndBudget(out)

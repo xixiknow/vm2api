@@ -7,6 +7,7 @@ export const GEMINI_STRATEGIES = Object.freeze(['balanced', 'fill', 'round_robin
 
 export const DEFAULT_GEMINI_ROUTING = Object.freeze({
   enabled: true,
+  official_passthrough: true,
   protocols: Object.freeze({
     'google.gemini': Object.freeze({ mode: 'native', enabled: true }),
     'anthropic.messages': Object.freeze({ mode: 'convert', enabled: true }),
@@ -86,6 +87,7 @@ export function validateGeminiRoutingPatch(body = {}) {
   const gem = asObject(body.gemini)
   if (!gem) throw typedError('gemini 必须是对象', 'invalid_gemini_routing')
   validateBoolean(gem, 'enabled', 'gemini', 'invalid_gemini_routing')
+  validateBoolean(gem, 'official_passthrough', 'gemini', 'invalid_gemini_routing')
 
   if (Object.hasOwn(gem, 'protocols') && gem.protocols !== undefined) {
     const protocols = asObject(gem.protocols)
@@ -264,6 +266,7 @@ export function normalizeGeminiRouting(raw = {}) {
 
   return {
     enabled: src.enabled !== false,
+    official_passthrough: src.official_passthrough !== false,
     protocols,
     pool,
     sticky,
