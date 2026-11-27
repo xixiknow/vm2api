@@ -130,7 +130,11 @@ test('renders cleanly with mixed Gemini and Anthropic (ag- prefixed) discovered 
       plan: 'Google AI Pro',
       expires_at: null,
       model_catalog: [
-        { id: 'claude-sonnet-4-6-high', provider: 'anthropic', quota_group: '3p' },
+        {
+          id: 'claude-sonnet-4-6-high',
+          provider: 'anthropic',
+          quota_group: '3p',
+        },
         { id: 'gemini-4-neon', provider: 'google', quota_group: 'gemini' },
         { id: 'gpt-oss-120b-medium', provider: 'openai', quota_group: '3p' },
       ],

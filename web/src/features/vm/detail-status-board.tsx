@@ -35,6 +35,8 @@ import {
 } from '@/lib/wrap-health'
 import { SlotIdentity } from '@/components/platform-chip'
 import { StatusMark } from '@/components/status-mark'
+import { SlotAutoResetControl } from '@/features/auto-reset/slot-auto-reset-control'
+import { SlotIqControl } from '@/features/gpt-iq/slot-iq-control'
 import { ActiveUsageAction } from '@/features/vm/active-usage-action'
 import { ClaudeResetActions } from '@/features/vm/claude-reset-actions'
 import { CodexKernelHealthFields } from '@/features/vm/codex-kernel-health-card'
@@ -327,6 +329,8 @@ export function VmStatusBoard(props: Props) {
                   cost5={cost5}
                   cost7={cost7}
                 />
+                <SlotAutoResetControl vm={vm} />
+                <SlotIqControl vm={vm} />
                 <PrevWindowMeter w={billing?.prev_window_5h} />
               </>
             ) : (

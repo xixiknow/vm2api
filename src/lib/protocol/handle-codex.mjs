@@ -43,6 +43,7 @@ import { vmNodeId } from '../cluster/placement.mjs'
 import { hostProxyUrlForVm } from '../vm/slot-host.mjs'
 import { openaiUsageAccountId, readCodexAccounts, upsertCodexAccount } from '../vm/codex-slot.mjs'
 import { noteCodexAuthFailure } from '../oauth/codex-login-guard.mjs'
+import { noteCodexQuotaExhausted, noteCodexQuotaObserved } from '../oauth/auto-reset-runtime.mjs'
 import { scopeAccountFromVm } from './jev-intercept.mjs'
 import {
   CODEX_APP_VERSION,
@@ -323,7 +324,9 @@ function ingestCodexHop(projectRoot, vmId, result, now = Date.now(), policy = nu
     quotaExceeded = String(result?.body?.error?.code || result?.error_code || '') === 'usage_limit_reached'
   }
   if (!extra && !limitedUntil && !codexCreditsFromHeaders(headers, now)) return null
-  return persistCodexUsage(projectRoot, vmId, { headers, extra, limitedUntil, quotaExceeded, now, policy })
+  const updated = persistCodexUsage(projectRoot, vmId, { headers, extra, limitedUntil, quotaExceeded, now, policy })
+  if (updated) noteCodexQuotaObserved(updated)
+  return updated
 }
 
 function execFor(projectRoot, vm) {
@@ -1256,6 +1259,7 @@ export async function handleCodexProtocol({
         const failureHold = !policyRefusal && codexFailureHold(result)
         if (failureHold) holdOpenAIAccount(vm.id, failureHold)
         if (failureHold?.reason === 'oauth_401') noteCodexAuthFailure(vm.id)
+        if (failureHold?.reason === 'rate_limited') noteCodexQuotaExhausted(vm.id)
         if (policyRefusal && policyRefusal !== 'upstream:billing_refusal') {
           stats.errors++
           const error = upstreamRiskClientError(policyRefusal, res._kinRequestId)

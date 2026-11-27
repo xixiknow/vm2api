@@ -21,6 +21,7 @@ import {
   TooltipTrigger,
 } from '@/components/ui/tooltip'
 import { StatusMark } from '@/components/status-mark'
+import { codexWorkspaceSummary } from '@/features/codex-login/batch-text'
 import { CodexLoginSlotCard } from '@/features/codex-login/slot-login-card'
 import { AllowedModelsCard } from '@/features/vm/allowed-models-card'
 import { AuthSchemeEditor } from '@/features/vm/auth-scheme-editor'
@@ -220,6 +221,13 @@ export function VmAccountTab(props: VmAccountTabProps) {
                   {String(vm.org_uuid || '—')}
                 </span>
               </Field>
+              {gpt && vm.codex_workspace ? (
+                <Field label='工作区' compact>
+                  <span className='text-xs text-muted-foreground'>
+                    {codexWorkspaceSummary(vm.codex_workspace) || '—'}
+                  </span>
+                </Field>
+              ) : null}
               {gpt ? null : (
                 <Field label='来源' compact>
                   {String(vm.oauth_source || '—')}

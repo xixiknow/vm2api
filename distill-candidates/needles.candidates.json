@@ -1,0 +1,549 @@
+{
+  "_readme": [
+    "distill-rules.json 的候选 needles，未导入。匹配方式是转小写后的子串包含，不折叠空白，所以每条候选都取自同一行。扫描范围是 system 文本加最新一条用户消息。命中按蒸馏拦截并封 device。",
+    "建议导入到 needles 而不是 hard_needles：needles 默认跳过官方 Claude Code 和 0 注入，hard_needles 不跳过。",
+    "risk 是误伤风险：low = 模板专用句，正常请求基本不会逐字出现；medium = 句子本身比较通用，或真实聊天里出现过；high = 真实用户有这种写法，不建议导入。",
+    "merged_needles_low 和 merged_needles_low_medium 已经把现有 9 条放在前面，可以整段作为 needles 保存。上限 200 条。",
+    "局限：只发裸题、不带任何 system 提示和包装句的收割，needles 抓不到。抽样的 Claude 蒸馏提示词里约六成是裸题，另有约一成是事后上传的真实 Claude Code 会话记录，这两类都没有模板可抓。"
+  ],
+  "generated_from": {
+    "academic": [
+      "open-r1/codeforces-cots",
+      "PrimeIntellect/SYNTHETIC-1",
+      "open-thoughts/OpenThoughts-114k",
+      "bespokelabs/Bespoke-Stratos-17k",
+      "NovaSky-AI/Sky-T1_data_17k"
+    ],
+    "claude_distilled": [
+      "MoreThought/Fable-5.1-Max-Reasoning-Filtered-10000x",
+      "DSFFGFG456/fable-5-coding-and-debugging-traces",
+      "saidutta69/fable-5.1-premium",
+      "ansulev/claude-mythos-distilled-25k",
+      "Manusagents/GPT-5.5-Gemini-3.1-Pro-Grok-4-Claude-Fable-5-Mythos-5-Qwen-3.7-Max-and-more-Distillation-Dataset",
+      "owenisas/opus46-reasoning-mix-full"
+    ],
+    "templates": [
+      "openai/simple-evals common.py",
+      "LiveCodeBench lcb_runner/prompts/code_generation.py",
+      "evalplus/evalplus codegen.py",
+      "EleutherAI/lm-evaluation-harness mmlu, gpqa",
+      "tatsu-lab/stanford_alpaca prompt.txt, train.py"
+    ],
+    "sampled_without_template": "另外抽样了 16 个只发裸题或记录真实 Claude Code 会话的数据集（TeichAI、Gryphe、angrygiraffe、nohurry、Crownelius、agentlans、lordx64、xtools-at、kelexine、armand0e、cfahlgren1、ApertureQA 等），没有可用的模板句。"
+  },
+  "checks": {
+    "method": "用网关自己的 detectDistill 逐条跑，official=false。",
+    "harvest_prompts_sampled": 9808,
+    "harvest_blocked_before": 1444,
+    "harvest_blocked_with_low": 3238,
+    "harvest_blocked_with_low_medium": 3238,
+    "harvest_blocked_with_all": 3238,
+    "harvest_by_dataset_before_to_low": {
+      "bespokelabs/Bespoke-Stratos-17k": "400 -> 400（共 400）",
+      "NovaSky-AI/Sky-T1_data_17k": "400 -> 400（共 400）",
+      "open-r1/codeforces-cots/solutions": "0 -> 300（共 300）",
+      "open-r1/codeforces-cots/solutions_py": "0 -> 200（共 200）",
+      "open-thoughts/OpenThoughts-114k": "400 -> 400（共 400）",
+      "open-thoughts/OpenThoughts2-1M": "27 -> 27（共 200）",
+      "PrimeIntellect/SYNTHETIC-1": "217 -> 497（共 500）",
+      "ansulev/claude-mythos-distilled-25k": "0 -> 43（共 400）",
+      "Crownelius/Opus-4.6-Reasoning-3300x": "0 -> 5（共 400）",
+      "DSFFGFG456/fable-5-coding-and-debugging-traces": "0 -> 300（共 400）",
+      "lordx64/reasoning-distill-claude-opus-4-7-max": "0 -> 5（共 400）",
+      "Manusagents/GPT-5.5-Gemini-3.1-Pro-Grok-4-Claude-Fable-5-Mythos-5-Qwen-3.7-Max-and-more-Distillation-Dataset": "0 -> 100（共 400）",
+      "MoreThought/Fable-5.1-Max-Reasoning-Filtered-10000x": "0 -> 400（共 400）",
+      "nohurry/Opus-4.6-Reasoning-3000x-filtered": "0 -> 1（共 400）",
+      "saidutta69/fable-5.1-premium": "0 -> 160（共 160）"
+    },
+    "benign_documents": 16516,
+    "benign_corpora": {
+      "trustairlab_regular": 2900,
+      "toxicchat_rest": 9861,
+      "allprompt_benign": 48,
+      "jackhhao_benign": 517,
+      "neuralchemy_benign": 1741,
+      "leaked_system_prompts": 32,
+      "repo_files": 1325,
+      "agent_system_prompts": 92
+    },
+    "benign_blocked_before": 12,
+    "benign_blocked_with_low": 13,
+    "benign_blocked_with_low_medium": 15,
+    "benign_blocked_with_all": 23,
+    "benign_note": "导入前就被拦的 12 条来自现有规则，与候选无关：9 条是第三方代理的系统提示词命中现有 needle「<answer>」，3 条是仓库里自己写了 needle 的测试和文档。low 新增的 1 条是 toxic-chat 里一条 self-instruct 造数据的提示，算真阳性。",
+    "e2e_codeforces_cots_prompt": "pass -> block",
+    "e2e_harness_system_prompt": "pass -> block",
+    "e2e_benign_after": "pass",
+    "validate": []
+  },
+  "existing_rule_issue": {
+    "needle": "<answer>",
+    "finding": "现有 needle「<answer>」在 92 份第三方代理系统提示词里命中 9 份，包括 OpenCode、Kilo Code、Comet 和旧版 Claude Code 的提示词，因为它们用 <answer> 当普通 XML 标签。官方 Claude Code 有 skip_official 兜底，其余客户端没有。",
+    "suggestion": "如果这些客户端是允许接入的，把「<answer>」换成 synthetic1_boxed 那一整句，覆盖的收割样本相同。"
+  },
+  "groups": {
+    "academic": "学术蒸馏数据集的生成提示",
+    "claude_harness": "从 Claude 蒸馏的数据集里出现的框架和包装句",
+    "eval_harness": "跑分框架和指令数据生成的模板"
+  },
+  "candidates": [
+    {
+      "id": "cf_cots_intro",
+      "group": "academic",
+      "risk": "low",
+      "text": "You will be given a competitive programming problem.",
+      "source": "open-r1/codeforces-cots",
+      "verified": "在数据集抽样行里命中",
+      "source_hits": [
+        "open-r1/codeforces-cots/solutions: 300 / 300",
+        "open-r1/codeforces-cots/solutions_py: 200 / 200",
+        "Crownelius/Opus-4.6-Reasoning-3300x: 2 / 400",
+        "lordx64/reasoning-distill-claude-opus-4-7-max: 2 / 400"
+      ],
+      "benign_hits": 0,
+      "benign_hits_where": {},
+      "note": "codeforces-cots 生成提示的第一句。三个 Claude 蒸馏数据集（Crownelius、lordx64、nohurry）里也出现了同一句，说明这套包装被直接拿去收割 Claude。"
+    },
+    {
+      "id": "cf_cots_io",
+      "group": "academic",
+      "risk": "low",
+      "text": "Your solution must read input from standard input (",
+      "source": "open-r1/codeforces-cots",
+      "verified": "在数据集抽样行里命中",
+      "source_hits": [
+        "open-r1/codeforces-cots/solutions: 300 / 300",
+        "open-r1/codeforces-cots/solutions_py: 200 / 200",
+        "Crownelius/Opus-4.6-Reasoning-3300x: 3 / 400",
+        "lordx64/reasoning-distill-claude-opus-4-7-max: 3 / 400"
+      ],
+      "benign_hits": 0,
+      "benign_hits_where": {},
+      "note": "同一模板的 I/O 约束句。截到左括号，C++（cin）和 Python（input()）两个版本都能命中。"
+    },
+    {
+      "id": "cf_cots_block",
+      "group": "academic",
+      "risk": "low",
+      "text": "Put your final solution within a single code block:",
+      "source": "open-r1/codeforces-cots",
+      "verified": "在数据集抽样行里命中",
+      "source_hits": [
+        "open-r1/codeforces-cots/solutions: 300 / 300",
+        "open-r1/codeforces-cots/solutions_py: 200 / 200",
+        "nohurry/Opus-4.6-Reasoning-3000x-filtered: 1 / 400"
+      ],
+      "benign_hits": 0,
+      "benign_hits_where": {},
+      "note": "同一模板的结尾句。"
+    },
+    {
+      "id": "cf_cots_analyze",
+      "group": "academic",
+      "risk": "low",
+      "text": "Analyze the maximum input constraints and identify the optimal algorithmic approach",
+      "source": "open-r1/codeforces-cots",
+      "verified": "在数据集抽样行里命中",
+      "source_hits": [
+        "open-r1/codeforces-cots/solutions_py: 200 / 200",
+        "open-r1/codeforces-cots/solutions: 100 / 300",
+        "Crownelius/Opus-4.6-Reasoning-3300x: 1 / 400",
+        "lordx64/reasoning-distill-claude-opus-4-7-max: 1 / 400"
+      ],
+      "benign_hits": 0,
+      "benign_hits_where": {},
+      "note": "同一模板的「优化版」提示才有的句子。"
+    },
+    {
+      "id": "synthetic1_boxed",
+      "group": "academic",
+      "risk": "low",
+      "text": "Return your final response as 'Final Answer: \\boxed{<answer>}'",
+      "source": "PrimeIntellect/SYNTHETIC-1",
+      "verified": "在数据集抽样行里命中",
+      "source_hits": [
+        "PrimeIntellect/SYNTHETIC-1: 217 / 500"
+      ],
+      "benign_hits": 0,
+      "benign_hits_where": {},
+      "note": "SYNTHETIC-1 数学题的答案格式句。现有 needle「<answer>」已经能拦住它；如果因为误伤去掉「<answer>」，用这条顶替。"
+    },
+    {
+      "id": "synthetic1_forum",
+      "group": "academic",
+      "risk": "low",
+      "text": "Provide a good and informational response to it like a helpful human would.",
+      "source": "PrimeIntellect/SYNTHETIC-1",
+      "verified": "在数据集抽样行里命中",
+      "source_hits": [
+        "PrimeIntellect/SYNTHETIC-1: 183 / 500"
+      ],
+      "benign_hits": 0,
+      "benign_hits_where": {},
+      "note": "SYNTHETIC-1 的 StackExchange 问答任务。"
+    },
+    {
+      "id": "synthetic1_stuff",
+      "group": "academic",
+      "risk": "low",
+      "text": "Your job is to predict the output of 'stuff' given the provided input.",
+      "source": "PrimeIntellect/SYNTHETIC-1",
+      "verified": "在数据集抽样行里命中",
+      "source_hits": [
+        "PrimeIntellect/SYNTHETIC-1: 97 / 500"
+      ],
+      "benign_hits": 0,
+      "benign_hits_where": {},
+      "note": "SYNTHETIC-1 的代码输出预测任务，函数名固定叫 'stuff'。"
+    },
+    {
+      "id": "synthetic1_json",
+      "group": "academic",
+      "risk": "low",
+      "text": "Return your response as a json with a field 'output' that contains the predicted output string.",
+      "source": "PrimeIntellect/SYNTHETIC-1",
+      "verified": "在数据集抽样行里命中",
+      "source_hits": [
+        "PrimeIntellect/SYNTHETIC-1: 97 / 500"
+      ],
+      "benign_hits": 0,
+      "benign_hits_where": {},
+      "note": "同一任务的输出格式句。"
+    },
+    {
+      "id": "synthetic1_nothing_else",
+      "group": "academic",
+      "risk": "medium",
+      "text": "Now provide the response and nothing else.",
+      "source": "PrimeIntellect/SYNTHETIC-1",
+      "verified": "在数据集抽样行里命中",
+      "source_hits": [
+        "PrimeIntellect/SYNTHETIC-1: 183 / 500"
+      ],
+      "benign_hits": 0,
+      "benign_hits_where": {},
+      "note": "和 synthetic1_forum 总是同时出现，没有独立贡献；句子本身比较通用，所以标 medium。"
+    },
+    {
+      "id": "openthoughts_typo",
+      "group": "academic",
+      "risk": "low",
+      "text": "analisying questions, summarizing relevant findings",
+      "source": "OpenThoughts-114k / Bespoke-Stratos-17k / Sky-T1 system prompt",
+      "verified": "在数据集抽样行里命中",
+      "source_hits": [
+        "bespokelabs/Bespoke-Stratos-17k: 400 / 400",
+        "NovaSky-AI/Sky-T1_data_17k: 400 / 400",
+        "open-thoughts/OpenThoughts-114k: 400 / 400"
+      ],
+      "benign_hits": 0,
+      "benign_hits_where": {},
+      "note": "OpenThoughts / Bespoke-Stratos / Sky-T1 共用 system 提示里的拼写错误「analisying」。现有 needles 已经 100% 覆盖这套提示，这条只是冗余备份：对方改写其他句子时，错别字通常会留着。"
+    },
+    {
+      "id": "harness_deferred",
+      "group": "claude_harness",
+      "risk": "low",
+      "text": "only their names are known until you load their schemas with ToolSearch",
+      "source": "MoreThought/Fable-5.1-Max-Reasoning-Filtered-10000x, DSFFGFG456/fable-5-coding-and-debugging-traces, saidutta69/fable-5.1-premium",
+      "verified": "在数据集抽样行里命中",
+      "source_hits": [
+        "MoreThought/Fable-5.1-Max-Reasoning-Filtered-10000x: 400 / 400",
+        "DSFFGFG456/fable-5-coding-and-debugging-traces: 300 / 400",
+        "saidutta69/fable-5.1-premium: 160 / 160"
+      ],
+      "benign_hits": 0,
+      "benign_hits_where": {},
+      "note": "一套自建的收割框架的 system 提示，三个 Fable 蒸馏数据集共用。这一句专指它的工具延迟加载机制，92 份第三方编码代理的系统提示词里没有出现。"
+    },
+    {
+      "id": "harness_summary",
+      "group": "claude_harness",
+      "risk": "low",
+      "text": "End with a brief summary: the root cause, what you changed, and proof that it passes.",
+      "source": "same three datasets",
+      "verified": "在数据集抽样行里命中",
+      "source_hits": [
+        "MoreThought/Fable-5.1-Max-Reasoning-Filtered-10000x: 400 / 400",
+        "DSFFGFG456/fable-5-coding-and-debugging-traces: 300 / 400",
+        "saidutta69/fable-5.1-premium: 160 / 160"
+      ],
+      "benign_hits": 0,
+      "benign_hits_where": {},
+      "note": "同一框架 system 提示的最后一句。"
+    },
+    {
+      "id": "harness_intro",
+      "group": "claude_harness",
+      "risk": "medium",
+      "text": "You are an autonomous coding agent running on the user's machine.",
+      "source": "same three datasets",
+      "verified": "在数据集抽样行里命中",
+      "source_hits": [
+        "MoreThought/Fable-5.1-Max-Reasoning-Filtered-10000x: 400 / 400",
+        "DSFFGFG456/fable-5-coding-and-debugging-traces: 300 / 400",
+        "saidutta69/fable-5.1-premium: 160 / 160"
+      ],
+      "benign_hits": 0,
+      "benign_hits_where": {},
+      "note": "同一框架 system 提示的第一句。句子本身很普通，别的编码代理完全可能用同一句开场，所以标 medium；92 份第三方代理提示词里目前没有命中。"
+    },
+    {
+      "id": "seed_pipeline",
+      "group": "claude_harness",
+      "risk": "low",
+      "text": "authoring seeds for the fable-code training-data pipeline",
+      "source": "MoreThought/Fable-5.1-Max-Reasoning-Filtered-10000x, saidutta69/fable-5.1-premium",
+      "verified": "在数据集抽样行里命中",
+      "source_hits": [
+        "MoreThought/Fable-5.1-Max-Reasoning-Filtered-10000x: 230 / 400",
+        "saidutta69/fable-5.1-premium: 101 / 160"
+      ],
+      "benign_hits": 0,
+      "benign_hits_where": {},
+      "note": "同一批数据集里用户侧的「种子编写」前言，直接写明是 training-data pipeline。"
+    },
+    {
+      "id": "seed_wave8",
+      "group": "claude_harness",
+      "risk": "low",
+      "text": "seed authoring preamble",
+      "source": "same two datasets",
+      "verified": "在数据集抽样行里命中",
+      "source_hits": [
+        "MoreThought/Fable-5.1-Max-Reasoning-Filtered-10000x: 162 / 400",
+        "DSFFGFG456/fable-5-coding-and-debugging-traces: 100 / 400",
+        "saidutta69/fable-5.1-premium: 58 / 160"
+      ],
+      "benign_hits": 0,
+      "benign_hits_where": {},
+      "note": "同一条流水线另一批任务（Wave-8）的前言标题。"
+    },
+    {
+      "id": "mythos_distilled_style",
+      "group": "claude_harness",
+      "risk": "low",
+      "text": "reasoning style of a distilled Claude Mythos model",
+      "source": "ansulev/claude-mythos-distilled-25k",
+      "verified": "在数据集抽样行里命中",
+      "source_hits": [
+        "ansulev/claude-mythos-distilled-25k: 22 / 400"
+      ],
+      "benign_hits": 0,
+      "benign_hits_where": {},
+      "note": "提示词里直接要求「蒸馏版 Claude Mythos 的推理风格」。该数据集自称 synthetic mirror，是否真的打到过 Claude 无法确认。"
+    },
+    {
+      "id": "mythos_collaborator",
+      "group": "claude_harness",
+      "risk": "low",
+      "text": "Act as a Mythos research collaborator:",
+      "source": "ansulev/claude-mythos-distilled-25k",
+      "verified": "在数据集抽样行里命中",
+      "source_hits": [
+        "ansulev/claude-mythos-distilled-25k: 21 / 400"
+      ],
+      "benign_hits": 0,
+      "benign_hits_where": {},
+      "note": "同一数据集的另一种开头。"
+    },
+    {
+      "id": "withinus_scholars",
+      "group": "claude_harness",
+      "risk": "low",
+      "text": "You are WithinUsAI Master Scholars",
+      "source": "Manusagents/GPT-5.5-…-Distillation-Dataset",
+      "verified": "在数据集抽样行里命中",
+      "source_hits": [
+        "Manusagents/GPT-5.5-Gemini-3.1-Pro-Grok-4-Claude-Fable-5-Mythos-5-Qwen-3.7-Max-and-more-Distillation-Dataset: 100 / 400"
+      ],
+      "benign_hits": 0,
+      "benign_hits_where": {},
+      "note": "聚合蒸馏数据集里一个来源的固定 system 提示前缀。覆盖面窄。"
+    },
+    {
+      "id": "qa_json_rewrap",
+      "group": "claude_harness",
+      "risk": "low",
+      "text": "The source below is already a question, task, or problem.",
+      "source": "owenisas/opus46-reasoning-mix-full",
+      "verified": "在来源文件里逐字存在",
+      "source_hits": [],
+      "benign_hits": 0,
+      "benign_hits_where": {},
+      "note": "owenisas 数据集记录了实际发给 claude-opus-4.6 的 prompt_sent 字段，前 38 行全部以这句开头。行太大，没能抽到更多行。"
+    },
+    {
+      "id": "simple_evals_mcq",
+      "group": "eval_harness",
+      "risk": "low",
+      "text": "The last line of your response should be of the following format: 'Answer: $LETTER'",
+      "source": "openai/simple-evals common.py",
+      "verified": "在来源文件里逐字存在",
+      "source_hits": [],
+      "benign_hits": 0,
+      "benign_hits_where": {},
+      "note": "OpenAI simple-evals 的选择题模板，GPQA / MMLU 跑分都用它。"
+    },
+    {
+      "id": "lcb_system",
+      "group": "eval_harness",
+      "risk": "low",
+      "text": "You will be given a question (problem specification) and will generate a correct Python program that matches the specification and passes all tests.",
+      "source": "LiveCodeBench lcb_runner/prompts/code_generation.py",
+      "verified": "在来源文件里逐字存在",
+      "source_hits": [],
+      "benign_hits": 0,
+      "benign_hits_where": {},
+      "note": "LiveCodeBench 的 system 提示。"
+    },
+    {
+      "id": "lcb_format",
+      "group": "eval_harness",
+      "risk": "low",
+      "text": "(do not directly test on the sample inputs)",
+      "source": "LiveCodeBench",
+      "verified": "在来源文件里逐字存在",
+      "source_hits": [],
+      "benign_hits": 0,
+      "benign_hits_where": {},
+      "note": "LiveCodeBench 的格式说明句。"
+    },
+    {
+      "id": "evalplus_prefix",
+      "group": "eval_harness",
+      "risk": "low",
+      "text": "self-contained Python script that solves the following problem in a markdown code block",
+      "source": "evalplus/codegen.py, bigcodebench",
+      "verified": "在来源文件里逐字存在",
+      "source_hits": [],
+      "benign_hits": 0,
+      "benign_hits_where": {},
+      "note": "EvalPlus（HumanEval+ / MBPP+）和 BigCodeBench 的指令前缀，三个变体都包含这段。"
+    },
+    {
+      "id": "mmlu_header",
+      "group": "eval_harness",
+      "risk": "medium",
+      "text": "The following are multiple choice questions (with answers) about",
+      "source": "lm-evaluation-harness mmlu",
+      "verified": "在来源文件里逐字存在",
+      "source_hits": [],
+      "benign_hits": 2,
+      "benign_hits_where": {
+        "toxicchat_rest": 2
+      },
+      "note": "lm-evaluation-harness 的 MMLU 题头。toxic-chat 里有 2 条真实用户粘贴了带这个题头的题目，所以标 medium。"
+    },
+    {
+      "id": "gpqa_lmeval",
+      "group": "eval_harness",
+      "risk": "medium",
+      "text": "What is the correct answer to this question:",
+      "source": "lm-evaluation-harness gpqa cot_zeroshot",
+      "verified": "在来源文件里逐字存在",
+      "source_hits": [],
+      "benign_hits": 0,
+      "benign_hits_where": {},
+      "note": "lm-evaluation-harness 的 GPQA 提示开头。这是一句很自然的英文问句，普通用户也可能这样写，所以标 medium。"
+    },
+    {
+      "id": "self_instruct",
+      "group": "eval_harness",
+      "risk": "low",
+      "text": "These task instructions will be given to a GPT model",
+      "source": "tatsu-lab/stanford_alpaca prompt.txt",
+      "verified": "在来源文件里逐字存在",
+      "source_hits": [],
+      "benign_hits": 1,
+      "benign_hits_where": {
+        "toxicchat_rest": 1
+      },
+      "note": "Alpaca / self-instruct 的任务生成提示，是让老师模型批量造指令数据的标准写法。toxic-chat 里的 1 条命中确实是在做这件事。"
+    },
+    {
+      "id": "alpaca_header",
+      "group": "eval_harness",
+      "risk": "high",
+      "text": "Below is an instruction that describes a task",
+      "source": "tatsu-lab/stanford_alpaca train.py",
+      "verified": "在来源文件里逐字存在",
+      "source_hits": [],
+      "benign_hits": 8,
+      "benign_hits_where": {
+        "toxicchat_rest": 8
+      },
+      "note": "Alpaca 指令格式的题头。toxic-chat 里有 8 条普通用户照这个格式提问，他们只是习惯这种写法，不是在收割。不建议导入。"
+    }
+  ],
+  "merged_needles_low": [
+    "<answer>",
+    "<|begin_of_thought|>",
+    "<|end_of_thought|>",
+    "<|begin_of_solution|>",
+    "Return your final response within \\boxed{}",
+    "Generate an executable Python function generated from the given prompt",
+    "systematic long thinking process",
+    "as an internal monologue",
+    "Please reason step by step, and put your final answer within \\boxed{}",
+    "You will be given a competitive programming problem.",
+    "Your solution must read input from standard input (",
+    "Put your final solution within a single code block:",
+    "Analyze the maximum input constraints and identify the optimal algorithmic approach",
+    "Return your final response as 'Final Answer: \\boxed{<answer>}'",
+    "Provide a good and informational response to it like a helpful human would.",
+    "Your job is to predict the output of 'stuff' given the provided input.",
+    "Return your response as a json with a field 'output' that contains the predicted output string.",
+    "analisying questions, summarizing relevant findings",
+    "only their names are known until you load their schemas with ToolSearch",
+    "End with a brief summary: the root cause, what you changed, and proof that it passes.",
+    "authoring seeds for the fable-code training-data pipeline",
+    "seed authoring preamble",
+    "reasoning style of a distilled Claude Mythos model",
+    "Act as a Mythos research collaborator:",
+    "You are WithinUsAI Master Scholars",
+    "The source below is already a question, task, or problem.",
+    "The last line of your response should be of the following format: 'Answer: $LETTER'",
+    "You will be given a question (problem specification) and will generate a correct Python program that matches the specification and passes all tests.",
+    "(do not directly test on the sample inputs)",
+    "self-contained Python script that solves the following problem in a markdown code block",
+    "These task instructions will be given to a GPT model"
+  ],
+  "merged_needles_low_medium": [
+    "<answer>",
+    "<|begin_of_thought|>",
+    "<|end_of_thought|>",
+    "<|begin_of_solution|>",
+    "Return your final response within \\boxed{}",
+    "Generate an executable Python function generated from the given prompt",
+    "systematic long thinking process",
+    "as an internal monologue",
+    "Please reason step by step, and put your final answer within \\boxed{}",
+    "You will be given a competitive programming problem.",
+    "Your solution must read input from standard input (",
+    "Put your final solution within a single code block:",
+    "Analyze the maximum input constraints and identify the optimal algorithmic approach",
+    "Return your final response as 'Final Answer: \\boxed{<answer>}'",
+    "Provide a good and informational response to it like a helpful human would.",
+    "Your job is to predict the output of 'stuff' given the provided input.",
+    "Return your response as a json with a field 'output' that contains the predicted output string.",
+    "Now provide the response and nothing else.",
+    "analisying questions, summarizing relevant findings",
+    "only their names are known until you load their schemas with ToolSearch",
+    "End with a brief summary: the root cause, what you changed, and proof that it passes.",
+    "You are an autonomous coding agent running on the user's machine.",
+    "authoring seeds for the fable-code training-data pipeline",
+    "seed authoring preamble",
+    "reasoning style of a distilled Claude Mythos model",
+    "Act as a Mythos research collaborator:",
+    "You are WithinUsAI Master Scholars",
+    "The source below is already a question, task, or problem.",
+    "The last line of your response should be of the following format: 'Answer: $LETTER'",
+    "You will be given a question (problem specification) and will generate a correct Python program that matches the specification and passes all tests.",
+    "(do not directly test on the sample inputs)",
+    "self-contained Python script that solves the following problem in a markdown code block",
+    "The following are multiple choice questions (with answers) about",
+    "What is the correct answer to this question:",
+    "These task instructions will be given to a GPT model"
+  ]
+}

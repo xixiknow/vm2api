@@ -12,7 +12,11 @@ import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
 import { ConfirmDialog } from '@/components/confirm-dialog'
 import { StatusMark } from '@/components/status-mark'
-import { codexLoginCodeText, codexLoginErrorText } from './batch-text'
+import {
+  codexAuthStageText,
+  codexLoginCodeText,
+  codexLoginErrorText,
+} from './batch-text'
 import { profileTone } from './profile-tone'
 import {
   CODEX_LOGIN_BASE,
@@ -282,8 +286,35 @@ export function CodexLoginSlotCard({ vmId }: { vmId: string }) {
                 }
                 onClick={() => act.mutate({ path: '/relogin', method: 'POST' })}
               >
-                {profile.relogin.state !== 'idle' ? '重登中' : '立即重登'}
+                {profile.relogin.state === 'queued'
+                  ? '排队重登'
+                  : profile.relogin.state !== 'idle'
+                    ? profile.relogin.stage
+                      ? `重登中 · ${codexAuthStageText(profile.relogin.stage)}`
+                      : '重登中'
+                    : '立即重登'}
               </Button>
+              {state?.auto_paused === 'workspace_not_found' ||
+              state?.last_relogin_error === 'workspace_not_found' ? (
+                <Button
+                  size='sm'
+                  variant='outline'
+                  disabled={
+                    act.isPending ||
+                    profile.relogin.state !== 'idle' ||
+                    profile.secret_unreadable
+                  }
+                  onClick={() =>
+                    act.mutate({
+                      path: '/relogin',
+                      method: 'POST',
+                      body: { allow_workspace_reselect: true },
+                    })
+                  }
+                >
+                  自动重选工作区并重登
+                </Button>
+              ) : null}
               {state?.auto_paused && profile.auto_relogin ? (
                 <Button
                   size='sm'

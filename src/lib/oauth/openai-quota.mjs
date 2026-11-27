@@ -38,6 +38,7 @@ export const CODEX_CREDITS_REFRESH_COOLDOWN_MS = 60_000
 const CODEX_BETA = 'codex-1'
 const HARD_UNAVAILABLE_STATUS = new Set(['dead', 'error', 'disabled'])
 const staleCreditsRefreshState = new Map()
+const resetInFlight = new Set()
 
 function num(value) {
   if (value == null || value === '') return null
@@ -647,61 +648,70 @@ export async function resetOpenaiQuota({ projectRoot, vmId, fetchImpl, rotate = 
   if (!slot.ok) return slot
   if (!slot.proxyUrl && !fetchImpl && !slot.direct) return fail('proxy_required', 'GPT 槽未绑定 SOCKS5', 400)
 
-  let current = slot
-  const headersOf = (access) => ({
-    ...buildOpenaiQuotaHeaders({ accessToken: access, accountId: current.accountId }),
-    'content-type': 'application/json',
-  })
-  const redeemId = redeemRequestId()
-
-  const consume = async (access) =>
-    quotaFetch(CHATGPT_RESET_CONSUME_URL, {
-      method: 'POST',
-      headers: headersOf(access),
-      body: JSON.stringify({ redeem_request_id: redeemId }),
-      proxyUrl: current.proxyUrl,
-      fetchImpl,
-      direct: current.direct,
+  const lockKey = `${String(projectRoot || '')}\0${String(vmId || '')}`
+  if (resetInFlight.has(lockKey)) {
+    return fail('reset_in_progress', '该槽正在使用重置券，请稍候', 409)
+  }
+  resetInFlight.add(lockKey)
+  try {
+    let current = slot
+    const headersOf = (access) => ({
+      ...buildOpenaiQuotaHeaders({ accessToken: access, accountId: current.accountId }),
+      'content-type': 'application/json',
     })
+    const redeemId = redeemRequestId()
 
-  let res = await consume(current.access)
-  if ((res.status === 401 || res.status === 403) && rotate && current.refresh) {
-    current = await rotateIfNeeded(current, projectRoot, vmId, fetchImpl)
-    if (!current.access || current.rotateError) {
-      return fail(current.rotateError || 'refresh_failed', 'GPT OAuth 刷新失败，请重新导入', 502)
+    const consume = async (access) =>
+      quotaFetch(CHATGPT_RESET_CONSUME_URL, {
+        method: 'POST',
+        headers: headersOf(access),
+        body: JSON.stringify({ redeem_request_id: redeemId }),
+        proxyUrl: current.proxyUrl,
+        fetchImpl,
+        direct: current.direct,
+      })
+
+    let res = await consume(current.access)
+    if ((res.status === 401 || res.status === 403) && rotate && current.refresh) {
+      current = await rotateIfNeeded(current, projectRoot, vmId, fetchImpl)
+      if (!current.access || current.rotateError) {
+        return fail(current.rotateError || 'refresh_failed', 'GPT OAuth 刷新失败，请重新导入', 502)
+      }
+      res = await consume(current.access)
     }
-    res = await consume(current.access)
-  }
-  if (res.error && !res.status) return res
-  if (res.status === 401 || res.status === 403) {
-    return fail('upstream_auth', 'GPT 凭证已失效，请重新导入', mapUpstreamStatus(res.status), {
-      upstream_status: res.status,
-    })
-  }
-  if (!res.ok) {
-    return fail('upstream_error', `消费重置券失败（${res.status || 0}）`, mapUpstreamStatus(res.status || 502), {
-      upstream_status: res.status,
-    })
-  }
+    if (res.error && !res.status) return res
+    if (res.status === 401 || res.status === 403) {
+      return fail('upstream_auth', 'GPT 凭证已失效，请重新导入', mapUpstreamStatus(res.status), {
+        upstream_status: res.status,
+      })
+    }
+    if (!res.ok) {
+      return fail('upstream_error', `消费重置券失败（${res.status || 0}）`, mapUpstreamStatus(res.status || 502), {
+        upstream_status: res.status,
+      })
+    }
 
-  const after = await queryUpstream(current, { fetchImpl, rotate: false, projectRoot, vmId, policy })
-  if (!after.ok) {
+    const after = await queryUpstream(current, { fetchImpl, rotate: false, projectRoot, vmId, policy })
+    if (!after.ok) {
+      return {
+        ok: true,
+        warning: 'reset_credit_cache_refresh_failed',
+        code: res.payload?.code || 'ok',
+        windows_reset: int(res.payload?.windows_reset ?? res.payload?.windowsReset) || 0,
+        reset_credits: null,
+        credits: null,
+        usage: null,
+        quota: null,
+        windows: [],
+      }
+    }
     return {
       ok: true,
-      warning: 'reset_credit_cache_refresh_failed',
       code: res.payload?.code || 'ok',
       windows_reset: int(res.payload?.windows_reset ?? res.payload?.windowsReset) || 0,
-      reset_credits: null,
-      credits: null,
-      usage: null,
-      quota: null,
-      windows: [],
+      ...after,
     }
-  }
-  return {
-    ok: true,
-    code: res.payload?.code || 'ok',
-    windows_reset: int(res.payload?.windows_reset ?? res.payload?.windowsReset) || 0,
-    ...after,
+  } finally {
+    resetInFlight.delete(lockKey)
   }
 }

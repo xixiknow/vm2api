@@ -9,7 +9,9 @@ import { api } from '@/lib/api'
 import { cn } from '@/lib/utils'
 import { PageHeader } from '@/components/page-header'
 import { QueryGate } from '@/components/query-gate'
+import { AutoResetPane } from '@/features/auto-reset/auto-reset-pane'
 import { CodexLoginPane } from '@/features/codex-login/login-service-pane'
+import { GptIqPane } from '@/features/gpt-iq/gpt-iq-pane'
 import { dashboardQueryOptions } from '@/features/overview/queries'
 import { AboutPane } from '@/features/settings/about-pane'
 import { BackupPane } from '@/features/settings/backup-pane'
@@ -152,7 +154,9 @@ export function SettingsPage() {
     tab === 'backup' ||
     tab === 'about' ||
     tab === 'gemini' ||
-    tab === 'gptlogin'
+    tab === 'gptlogin' ||
+    tab === 'autoreset' ||
+    tab === 'gptiq'
   const dirtyLabels = dirty ? dirtySettingsTabLabels(draft, routing.data) : []
   const saveBarSummary = dirty
     ? isNonRoutingTab ||
@@ -515,6 +519,8 @@ export function SettingsPage() {
               ) : null}
               {tab === 'socks5' ? <Socks5Pane /> : null}
               {tab === 'gptlogin' ? <CodexLoginPane /> : null}
+              {tab === 'autoreset' ? <AutoResetPane /> : null}
+              {tab === 'gptiq' ? <GptIqPane /> : null}
               {tab === 'backup' ? <BackupPane /> : null}
               {tab === 'about' ? <AboutPane /> : null}
               {tab === 'gemini' ? <GeminiInstallPane /> : null}

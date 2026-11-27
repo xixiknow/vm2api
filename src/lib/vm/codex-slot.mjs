@@ -35,8 +35,10 @@ export function readCodexAccounts(projectRoot, vmId) {
 
 export function writeCodexAccounts(projectRoot, vmId, accounts) {
   if (!projectRoot || !vmId) throw new Error('projectRoot and vmId required')
+  const file = codexCredentialPath(projectRoot, vmId)
+  fs.mkdirSync(path.dirname(file), { recursive: true })
   atomicWriteJson(
-    codexCredentialPath(projectRoot, vmId),
+    file,
     { accounts: Array.isArray(accounts) ? accounts.map(enrichCodexAccountIdentity) : [] },
     { mode: 0o600 },
   )
@@ -257,6 +259,36 @@ export function parseCodexImportPayload(body = {}) {
   return parseCodexCredentialInput(body, { mode })
 }
 
+const WORKSPACE_KINDS = new Set(['personal', 'organization', 'unknown'])
+const WORKSPACE_SELECTION_REASONS = new Set([
+  'explicit_id',
+  'single_workspace',
+  'history_success',
+  'organization_preferred',
+  'personal_preferred',
+  'stable_fallback',
+])
+
+function cleanWorkspaceMeta(src = {}) {
+  const kind = WORKSPACE_KINDS.has(src.workspace_kind) ? src.workspace_kind : null
+  const rawName = typeof src.workspace_name === 'string' ? src.workspace_name.trim().slice(0, 200) : ''
+  const reason = WORKSPACE_SELECTION_REASONS.has(src.workspace_selection_reason) ? src.workspace_selection_reason : null
+  const count =
+    Number.isInteger(src.workspace_candidate_count) &&
+    src.workspace_candidate_count >= 1 &&
+    src.workspace_candidate_count <= 100
+      ? src.workspace_candidate_count
+      : null
+  const missing = src.workspace_selection_missing === true
+  return {
+    workspace_kind: kind,
+    workspace_name: rawName || null,
+    workspace_selection_reason: reason,
+    workspace_candidate_count: count,
+    workspace_selection_missing: missing,
+  }
+}
+
 export function enrichCodexAccountIdentity(account = {}) {
   const next = { ...account }
   const idToken = firstString(next.id_token, next.idToken)
@@ -277,6 +309,17 @@ export function enrichCodexAccountIdentity(account = {}) {
   if (!idToken && !firstString(next.chatgpt_subscription_active_until)) {
     next.chatgpt_subscription_active_until = fromTokens.chatgpt_subscription_active_until || null
   }
+  const ws = cleanWorkspaceMeta(next)
+  if (ws.workspace_kind) next.workspace_kind = ws.workspace_kind
+  else delete next.workspace_kind
+  if (ws.workspace_name) next.workspace_name = ws.workspace_name
+  else delete next.workspace_name
+  if (ws.workspace_selection_reason) next.workspace_selection_reason = ws.workspace_selection_reason
+  else delete next.workspace_selection_reason
+  if (ws.workspace_candidate_count != null) next.workspace_candidate_count = ws.workspace_candidate_count
+  else delete next.workspace_candidate_count
+  if (ws.workspace_selection_missing) next.workspace_selection_missing = true
+  else delete next.workspace_selection_missing
   return next
 }
 
@@ -292,6 +335,11 @@ export function upsertCodexAccount(projectRoot, vmId, patch = {}, { replaceCrede
       'chatgpt_account_id',
       'chatgpt_subscription_active_until',
       'chatgpt_plan_type',
+      'workspace_kind',
+      'workspace_name',
+      'workspace_selection_reason',
+      'workspace_candidate_count',
+      'workspace_selection_missing',
       'access_token',
       'refresh_token',
       'id_token',
@@ -410,6 +458,25 @@ export function summarizeCodexSlot(projectRoot, vm = {}) {
   const usage = buildCodexUsageView(Object.keys(extra).length ? extraToCodexSnapshot(extra) : vm.codex?.usage || {})
   const hasAccess = !!(first.access_token || vm.codex?.has_access)
   const hasRefresh = !!(first.refresh_token || vm.codex?.has_refresh)
+  const chatgptAccountId = first.chatgpt_account_id || vm.codex?.chatgpt_account_id || null
+  const wsFromAccount = cleanWorkspaceMeta(first)
+  const wsFromVm = cleanWorkspaceMeta(vm.codex || {})
+  const wsKind = wsFromAccount.workspace_kind || wsFromVm.workspace_kind
+  const wsName = wsFromAccount.workspace_name || wsFromVm.workspace_name
+  const wsReason = wsFromAccount.workspace_selection_reason || wsFromVm.workspace_selection_reason
+  const wsCount = wsFromAccount.workspace_candidate_count ?? wsFromVm.workspace_candidate_count
+  const wsMissing = wsFromAccount.workspace_selection_missing || wsFromVm.workspace_selection_missing
+  const workspace =
+    chatgptAccountId || wsKind || wsName || wsReason || wsCount != null || wsMissing
+      ? {
+          id: chatgptAccountId,
+          kind: wsKind,
+          name: wsName,
+          selection_reason: wsReason,
+          candidate_count: wsCount,
+          selection_missing: wsMissing,
+        }
+      : null
   return {
     platform: 'openai',
     family: 'codex',
@@ -417,9 +484,10 @@ export function summarizeCodexSlot(projectRoot, vm = {}) {
     has_refresh: hasRefresh,
     email: first.email || vm.codex?.email || vm.email || null,
     expires_at: first.expires_at || vm.codex?.expires_at || null,
-    chatgpt_account_id: first.chatgpt_account_id || vm.codex?.chatgpt_account_id || null,
+    chatgpt_account_id: chatgptAccountId,
     chatgpt_subscription_active_until: first.chatgpt_subscription_active_until || null,
     chatgpt_plan_type: first.chatgpt_plan_type || null,
+    workspace,
     account_count: accounts.length,
     usage,
     reset_credits: vm.codex?.reset_credits || null,

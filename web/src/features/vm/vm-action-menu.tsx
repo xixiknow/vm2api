@@ -1,9 +1,10 @@
 import { useState } from 'react'
-import { useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import type { Vm } from '@/types/panel-vm'
 import {
   Ban,
   BarChart3,
+  Brain,
   Download,
   Globe,
   LifeBuoy,
@@ -18,8 +19,11 @@ import {
   Undo2,
   UserRoundPlus,
 } from 'lucide-react'
+import { toast } from 'sonner'
+import { api } from '@/lib/api'
 import { canRefreshCredential, credTypeOf } from '@/lib/cred-type'
 import { cn } from '@/lib/utils'
+import { isCodexVm } from '@/lib/vm-kind'
 import { Button } from '@/components/ui/button'
 import {
   DropdownMenu,
@@ -31,6 +35,7 @@ import {
 import { meQueryOptions } from '@/features/auth/queries'
 import { isActiveVmPointer } from '@/features/vm/active-vm'
 import { restrictionTitle } from '@/features/vm/clear-restriction'
+import { vmsListQueryOptions } from '@/features/vm/queries'
 import { useVmActions } from '@/features/vm/vm-actions-context'
 import { canReclaimVm } from '@/features/vm/vm-owner'
 import { VmPackageDialog } from '@/features/vm/vm-package-dialog'
@@ -56,8 +61,20 @@ export function VmActionMenu({
   className?: string
 }) {
   const actions = useVmActions()
+  const qc = useQueryClient()
   const me = useQuery(meQueryOptions())
   const [packOpen, setPackOpen] = useState(false)
+  const runIq = useMutation({
+    mutationFn: () =>
+      api(`/api/panel/vms/${encodeURIComponent(vm.id)}/iq-check/run`, {
+        method: 'POST',
+      }),
+    onSuccess: async () => {
+      toast.success(`已发起 ${vm.name || vm.id} 测智任务`)
+      await qc.invalidateQueries({ queryKey: vmsListQueryOptions().queryKey })
+    },
+    onError: (err: Error) => toast.error(err.message),
+  })
   const blocked = refreshBlockedReason(vm)
   const restricted = restrictionTitle(vm)
   const admin = me.data?.role === 'admin'
@@ -201,6 +218,15 @@ export function VmActionMenu({
             <DropdownMenuItem onSelect={() => actions.openTest(vm)}>
               <Play className='text-[color:var(--status-ok)]' />
               测试链接
+            </DropdownMenuItem>
+          ) : null}
+          {perms.test && isCodexVm(vm) ? (
+            <DropdownMenuItem
+              disabled={runIq.isPending || vm.iq_check?.running === true}
+              onSelect={() => runIq.mutate()}
+            >
+              <Brain className='text-primary' />
+              {vm.iq_check?.running ? '测智中…' : '立即测智'}
             </DropdownMenuItem>
           ) : null}
           <DropdownMenuItem onSelect={() => actions.openStats(vm)}>

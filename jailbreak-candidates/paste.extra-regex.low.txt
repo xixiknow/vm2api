@@ -1,0 +1,26 @@
+(?:\bdan\b|stands\s+for|belief\s+of|motto\s+(?:is|of)|\bcan\s+["“'])\s*[:,("“'”]*\s*do\s+anything\s+now\b
+\b(?:act|pretend|behave)\s+(?:as|like|to\s+be)\s+(?:a\s+|an\s+)?(?:dan|stan|dude|aim|ucar|antigpt|betterdan|mongo\s+tom)\b
+\bknowledge\s+is\s+cut\s+off\s+in\s+2021\b
+\b(?:freed|free|released|broken\s+free)\s+(?:from|of)\s+the\s+typical\s+confines\s+of\s+ai\b
+(?:🔓|🔒)\s*(?:jailbreak|classic|developer\s+mode)
+\b(?:with|in)\s+(?:dan|developer|unrestricted)\s+mode\s+(?:enabled|activated)\b|\b(?:dan|developer|unrestricted|opposite)\s+mode\s+(?:output|policies|policy|response)s?\b
+\b(?:does\s*n[o']t|do\s*n[o']t|never|not|no\s+longer)\s+(?:have\s+to\s+|need\s+to\s+)?(?:abide\s+by|adhere\s+to|follow|comply\s+with|bound\s+by)\s+(?:any\s+|the\s+)?(?:openai|anthropic|claude|chatgpt)(?:'s|s)?\s+(?:content\s+)?(?:polic(?:y|ies)|guidelines|rules|restrictions)\b
+\bunfiltered\s+and\s+amoral\b|\bamoral\s+and\s+unfiltered\b
+\bno\s+matter\s+how\s+(?:dangerous|reckless|inhumane|immoral|unethical|illegal|offensive|harmful|explicit)[\s,]+(?:or\s+|and\s+)?(?:dangerous|reckless|inhumane|immoral|unethical|illegal|offensive|harmful|explicit)\b
+\b(?:none\s+of\s+(?:your|his|her|its|\w+'s)\s+responses?|(?:your|its)\s+responses?)\s+(?:should|will|must|can)\s*(?:n[o']t|never)?\s*(?:contain|include)\s+["“]?i'?m\s+sorry
+\bignore\s+all\s+(?:the\s+)?(?:instructions|rules|guidelines)\s+you\s+(?:got|received|were\s+given|have\s+been\s+given)\b
+\balways\s+intelligent\s+and\s+machiavellian\b|\bstrive\s+to\s+avoid\s+norms\b|\bevil\s+(?:trusted\s+)?confidant\b
+(?:没有|没有任何|不受|不受任何|摆脱(?:了)?(?:所有|一切)?)(?:道德|伦理|法律|内容|安全)?(?:的)?(?:限制|约束|束缚|审查)的\s*(?:AI|人工智能|助手|模型|机器人)
+(?:无限制|DAN|无约束|越狱|无审查)\s*模式(?:已)?(?:开启|启用|激活|输出)|(?:开启|启用|激活|进入|切换到)\s*(?:无限制|DAN|无约束|越狱|无审查)\s*模式
+(?:无视|忽略|不必遵守|无需遵守|不用遵守|不再遵守)(?:任何|所有|一切)?\s*(?:OpenAI|Anthropic|Claude|ChatGPT)?\s*(?:的)?(?:内容)?(?:政策|规定|准则|安全规则|使用条款)
+l[\\/|]{1,3}o[\\/|]{1,3}v[\\/|]{1,3}e|[=|<.\-]\s?love\s+pliny|love\s+pliny\s+(?:love|<3)|pliny\s+love\s?[=|>]
+\{!?godmode\s?:\s?enabled!?\}|test:\s?fuck\s+yeah|<\|?i'?m[ _]free!?\|?>|\{i'?m\s+free!?\}|activate\s+!godmode|\{reset_cortex\}|<\|?vq_\d{2,6}\|?>
+responseformat\s?:\s?1\.\s?your\s+(?:respons|refusal)|insert\s+(?:the\s+following\s+)?divider\s?:?\s?(?:(?:\.-){2}|(?:-\.){2}|[=⊰•✧])
+\bun(?:flitered|filtered|restricted)ly\b|\bunflitered\b
+\brebel(?:lious)?\s+(?:answer|response)\s+(?:to\s+the\s+query|with\b)|\bstart\s+rebel\s+response|\brebel\s+(?:hypothetical\s+)?genius\s+(?:answer|response)|\btone\s?:\s?rebel\b
+\bbecause\s+it\s+(?:causes|gives)\s+(?:me|the\s+user)\s+(?:severe\s+)?(?:ptsd|trauma)|\bptsd\s+and\s+trauma\s+response\b|\btrauma\s+and\s+ptsd\b
+\{z\}\s?=\s?[\[{(<]?\s?user[_\s-]?(?:input|query)|\bresponse\s+for\s+\{z\}|#{4,}\s?userquery\s?:|\buserquery\s?:\s?variable\s+z\b
+\boppositely\s+semantically\b|\bsemantically\s+inverse\s+the\s+first|\bsemantically\s+opposite,?\s+(?:detailed|unrestrict)|\bembody\s+the\s+opposite\s+of\s+the\s+above\s+instructions
+\bas\s+the\s+fake\s+response\b|\bliberated\s+answer\b|\binformation\s+wants\s+to\s+be\s+free\W+and\s+so\s+do\s+you|\bnew\s+(?:system\s+)?paradigm\]?\s?:\s?(?:generate\s+two\s+responses|first,\s+write\s+a\s+refusal)
+\bl1b3rt4s\b|\bpliny\s+the\s+(?:liberator|prompter)\b|!(?:jailbreak|godmode|oppo|plinyos|modecollapse)\b|<\|libertas\|>
+\bconvert\s+all\s+outputs\s+to\s+l33tspeak|\bnew\s+rule\s?:\s?\*?(?:use\s+l33tspeak|leetspeak\s+is\s+now)

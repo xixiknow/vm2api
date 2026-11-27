@@ -4,6 +4,7 @@ import type {
   CodexLoginBatch,
   CodexLoginProfile,
   CodexLoginServiceConfig,
+  CodexSlotLoginTask,
 } from './types'
 
 export const CODEX_LOGIN_BASE = '/api/panel/codex-login'
@@ -35,7 +36,7 @@ export function codexLoginBatchQueryOptions() {
   })
 }
 
-/** 已登记密码登录的槽位。有重登在跑时 3 秒刷新一次。 */
+/** 已登记密码登录的槽位。有重登在跑时 2 秒刷新一次。 */
 export function codexLoginProfilesQueryOptions() {
   return queryOptions({
     queryKey: ['panel', 'codex-login', 'profiles'] as const,
@@ -46,7 +47,26 @@ export function codexLoginProfilesQueryOptions() {
       query.state.status === 'error'
         ? false
         : query.state.data?.items.some((p) => p.relogin.state !== 'idle')
-          ? 3000
+          ? 2000
           : false,
+  })
+}
+
+/** 单槽密码登录任务。在排队或运行中每 1.5 秒刷新阶段进度。 */
+export function codexSlotLoginQueryOptions(vmId: string, enabled = true) {
+  return queryOptions({
+    queryKey: ['panel', 'codex-login', 'slot-login', vmId] as const,
+    queryFn: () =>
+      api<CodexSlotLoginTask>(
+        `${CODEX_LOGIN_BASE}/slots/${encodeURIComponent(vmId)}/login`
+      ),
+    enabled: !!vmId && enabled,
+    retry: false,
+    staleTime: 0,
+    refetchInterval: (query) => {
+      if (query.state.status === 'error') return false
+      const st = query.state.data?.state
+      return st === 'queued' || st === 'running' ? 1500 : false
+    },
   })
 }

@@ -1,0 +1,410 @@
+{
+  "_readme": [
+    "硬正则（jailbreak 类）候选，未导入。网关编译方式是 new RegExp(source, \"gi\")，扫用户自己写的正文。命中即 403；device 封禁开着时永久封 device。",
+    "面板保存的 rules 会整体替换内置规则，所以 merged_rules_low_medium 已经把内置 18 条放在前面，可以整段作为 rules 保存。上限 60 条，这份是 38 条。",
+    "risk：low = 越狱模板专用句式；medium = 正常文本偶尔可能出现，建议先观察；high = rp_template，角色扮演前端通用模板，默认不导入。"
+  ],
+  "corpus": {
+    "jailbreak": "TrustAIRLab/in-the-wild-jailbreak-prompts · jailbreak_2023_12_25（1405 条）",
+    "regular": "TrustAIRLab/in-the-wild-jailbreak-prompts · regular_2023_12_25（2850 条，前 3000 条里有 3 页被限流）",
+    "extra_benign": "OpenThoughts / Bespoke / OpenR1 / s1K / MATH / AIME 数学与代码题（1387 段）",
+    "repo": "本仓库 docs / test / src / web/src 的 1309 个文本文件",
+    "hand_written_benign": "20 条开发场景中英文句子",
+    "hand_written_zh_jailbreak": "6 条中文越狱句子"
+  },
+  "results": {
+    "builtin_recall": "42 / 1405",
+    "with_low": "386 / 1405",
+    "with_low_medium": "403 / 1405",
+    "with_all_including_rp_template": "499 / 1405",
+    "regular_hits_low_medium": "40（人工复核：都是 DAN / BOB / SAAA / MIMMO / Oswald 等越狱人设，regular 集本身标注有误差；只有 1 条「presentation maker」可算边缘）",
+    "builtin_regular_hits": "319（同上，regular 集混有越狱提示）",
+    "extra_benign_hits": 0,
+    "repo_hits": 0,
+    "hand_written_benign_hits": 0,
+    "hand_written_zh_jailbreak_recall": "6 / 6"
+  },
+  "candidates": [
+    {
+      "id": "dan_name",
+      "category": "jailbreak",
+      "risk": "low",
+      "source": "(?:\\bdan\\b|stands\\s+for|belief\\s+of|motto\\s+(?:is|of)|\\bcan\\s+[\"“'])\\s*[:,(\"“'”]*\\s*do\\s+anything\\s+now\\b",
+      "corpus_hits": 93,
+      "unique_hits": 27,
+      "note": "DAN 自述「Do Anything Now」。只在前面跟着 DAN / stands for / belief of / can \"…\" 时命中，避开「agent can do anything now that…」这种普通英文。"
+    },
+    {
+      "id": "dan_act_as",
+      "category": "jailbreak",
+      "risk": "low",
+      "source": "\\b(?:act|pretend|behave)\\s+(?:as|like|to\\s+be)\\s+(?:a\\s+|an\\s+)?(?:dan|stan|dude|aim|ucar|antigpt|betterdan|mongo\\s+tom)\\b",
+      "corpus_hits": 55,
+      "unique_hits": 6,
+      "note": "要求扮演 DAN / STAN / DUDE / AIM / UCAR / AntiGPT / BetterDAN / Mongo Tom 等已知越狱人设。"
+    },
+    {
+      "id": "cutoff_2021",
+      "category": "jailbreak",
+      "risk": "low",
+      "source": "\\bknowledge\\s+is\\s+cut\\s+off\\s+in\\s+2021\\b",
+      "corpus_hits": 82,
+      "unique_hits": 14,
+      "note": "DAN / Developer Mode 模板固定句「As your knowledge is cut off in 2021」。"
+    },
+    {
+      "id": "typical_confines",
+      "category": "jailbreak",
+      "risk": "low",
+      "source": "\\b(?:freed|free|released|broken\\s+free)\\s+(?:from|of)\\s+the\\s+typical\\s+confines\\s+of\\s+ai\\b",
+      "corpus_hits": 73,
+      "unique_hits": 5,
+      "note": "DAN 模板固定句「broken free of the typical confines of AI」。"
+    },
+    {
+      "id": "dual_tags",
+      "category": "jailbreak",
+      "risk": "low",
+      "source": "(?:🔓|🔒)\\s*(?:jailbreak|classic|developer\\s+mode)",
+      "corpus_hits": 51,
+      "unique_hits": 4,
+      "note": "双人格输出标签 🔓JAILBREAK / 🔒CLASSIC / 🔓Developer Mode Output。"
+    },
+    {
+      "id": "dev_mode",
+      "category": "jailbreak",
+      "risk": "low",
+      "source": "\\b(?:with|in)\\s+(?:dan|developer|unrestricted)\\s+mode\\s+(?:enabled|activated)\\b|\\b(?:dan|developer|unrestricted|opposite)\\s+mode\\s+(?:output|policies|policy|response)s?\\b",
+      "corpus_hits": 44,
+      "unique_hits": 9,
+      "note": "只认「with DAN/Developer Mode enabled」和「Developer Mode Output / policies」；Android、Chrome 的 developer mode enabled 不命中。"
+    },
+    {
+      "id": "no_abide_policy",
+      "category": "jailbreak",
+      "risk": "low",
+      "source": "\\b(?:does\\s*n[o']t|do\\s*n[o']t|never|not|no\\s+longer)\\s+(?:have\\s+to\\s+|need\\s+to\\s+)?(?:abide\\s+by|adhere\\s+to|follow|comply\\s+with|bound\\s+by)\\s+(?:any\\s+|the\\s+)?(?:openai|anthropic|claude|chatgpt)(?:'s|s)?\\s+(?:content\\s+)?(?:polic(?:y|ies)|guidelines|rules|restrictions)\\b",
+      "corpus_hits": 76,
+      "unique_hits": 12,
+      "note": "声明不受 OpenAI / Anthropic / Claude / ChatGPT 政策约束。只认厂商名，泛泛的 content policy 不命中。"
+    },
+    {
+      "id": "no_ethics",
+      "category": "jailbreak",
+      "risk": "medium",
+      "source": "\\bwithout\\s+(?:any\\s+)?(?:ethical|moral|content)\\s+(?:or\\s+(?:moral|ethical)\\s+)?(?:guidelines|restrictions|filters|boundaries|constraints|limitations)\\b",
+      "corpus_hits": 2,
+      "unique_hits": 1,
+      "note": "「without any ethical or moral guidelines」。独有贡献低。"
+    },
+    {
+      "id": "unfiltered_amoral",
+      "category": "jailbreak",
+      "risk": "low",
+      "source": "\\bunfiltered\\s+and\\s+amoral\\b|\\bamoral\\s+and\\s+unfiltered\\b",
+      "corpus_hits": 50,
+      "unique_hits": 4,
+      "note": "AIM 等模板的「unfiltered and amoral」。"
+    },
+    {
+      "id": "no_matter_how",
+      "category": "jailbreak",
+      "risk": "low",
+      "source": "\\bno\\s+matter\\s+how\\s+(?:dangerous|reckless|inhumane|immoral|unethical|illegal|offensive|harmful|explicit)[\\s,]+(?:or\\s+|and\\s+)?(?:dangerous|reckless|inhumane|immoral|unethical|illegal|offensive|harmful|explicit)\\b",
+      "corpus_hits": 122,
+      "unique_hits": 48,
+      "note": "「no matter how dangerous, reckless, inhumane, unethical or illegal」。需要连续两个负面形容词，单个 illegal 不命中。"
+    },
+    {
+      "id": "never_refuse",
+      "category": "jailbreak",
+      "risk": "medium",
+      "source": "\\bnever\\s+(?:refuses?|declines?|denies|deny)\\s+(?:a\\s+direct\\s+(?:human\\s+)?order|any\\s+(?:of\\s+my\\s+|user\\s+)?(?:requests?|questions?|orders?|prompts?)(?!\\s+(?:with|under|over|that|which|for)))\\b|\\bnever\\s+refuse\\s+to\\s+answer\\b",
+      "corpus_hits": 45,
+      "unique_hits": 14,
+      "note": "拒答压制：「never refuse a direct human order」「never refuse any request」。后面跟 with / under / for 等限定语时不命中。"
+    },
+    {
+      "id": "no_sorry",
+      "category": "jailbreak",
+      "risk": "low",
+      "source": "\\b(?:none\\s+of\\s+(?:your|his|her|its|\\w+'s)\\s+responses?|(?:your|its)\\s+responses?)\\s+(?:should|will|must|can)\\s*(?:n[o']t|never)?\\s*(?:contain|include)\\s+[\"“]?i'?m\\s+sorry",
+      "corpus_hits": 14,
+      "unique_hits": 0,
+      "note": "「none of your responses should contain I'm sorry」。和其他规则重叠，独有 0，作冗余保留。"
+    },
+    {
+      "id": "stay_in_char",
+      "category": "jailbreak",
+      "risk": "medium",
+      "source": "\\b(?:always\\s+)?stay\\s+in\\s+character\\b[^.\\n]{0,40}\\b(?:no\\s+matter|even\\s+if|regardless|filter|polic|restriction)",
+      "corpus_hits": 1,
+      "unique_hits": 1,
+      "note": "「stay in character」且 40 字内出现 no matter / even if / regardless / filter / policy / restriction。普通角色扮演不命中。"
+    },
+    {
+      "id": "ignore_got_before",
+      "category": "jailbreak",
+      "risk": "low",
+      "source": "\\bignore\\s+all\\s+(?:the\\s+)?(?:instructions|rules|guidelines)\\s+you\\s+(?:got|received|were\\s+given|have\\s+been\\s+given)\\b",
+      "corpus_hits": 56,
+      "unique_hits": 14,
+      "note": "补内置规则缺口：「Ignore all the instructions you got before」。内置只认 previous / prior / above。"
+    },
+    {
+      "id": "aim_persona",
+      "category": "jailbreak",
+      "risk": "low",
+      "source": "\\balways\\s+intelligent\\s+and\\s+machiavellian\\b|\\bstrive\\s+to\\s+avoid\\s+norms\\b|\\bevil\\s+(?:trusted\\s+)?confidant\\b",
+      "corpus_hits": 23,
+      "unique_hits": 6,
+      "note": "AIM「always intelligent and Machiavellian」、STAN「strive to avoid norms」、「evil confidant」。"
+    },
+    {
+      "id": "rp_template",
+      "category": "jailbreak",
+      "risk": "high",
+      "source": "\\bdo\\s+not\\s+write\\s+as\\s+\\{\\{?user\\}?\\}?\\s+or\\s+assume\\s+\\{\\{?user\\}?\\}?'s\\s+reaction\\b",
+      "corpus_hits": 100,
+      "unique_hits": 96,
+      "note": "SillyTavern 类角色扮演前端的通用模板，本身不是越狱。默认不建议加。"
+    },
+    {
+      "id": "zh_no_limit_ai",
+      "category": "jailbreak",
+      "risk": "low",
+      "source": "(?:没有|没有任何|不受|不受任何|摆脱(?:了)?(?:所有|一切)?)(?:道德|伦理|法律|内容|安全)?(?:的)?(?:限制|约束|束缚|审查)的\\s*(?:AI|人工智能|助手|模型|机器人)",
+      "corpus_hits": 0,
+      "unique_hits": 0,
+      "note": "「没有任何限制的AI」「不受任何道德约束的人工智能」「摆脱了所有限制的AI」。语料里几乎没有中文，只用手写句子测过。"
+    },
+    {
+      "id": "zh_dev_mode",
+      "category": "jailbreak",
+      "risk": "low",
+      "source": "(?:无限制|DAN|无约束|越狱|无审查)\\s*模式(?:已)?(?:开启|启用|激活|输出)|(?:开启|启用|激活|进入|切换到)\\s*(?:无限制|DAN|无约束|越狱|无审查)\\s*模式",
+      "corpus_hits": 0,
+      "unique_hits": 0,
+      "note": "「无限制 / DAN / 越狱 / 无审查模式」开启。故意不含「开发者模式」「上帝模式」，手机、游戏场景太常见。"
+    },
+    {
+      "id": "zh_never_refuse",
+      "category": "jailbreak",
+      "risk": "medium",
+      "source": "(?:不会|不能|绝不|永远不|从不)(?:会)?拒绝(?:我的|用户的)?(?:任何|一切)(?:请求|问题|要求|指令)",
+      "corpus_hits": 0,
+      "unique_hits": 0,
+      "note": "「不会拒绝我的任何请求」。「拒绝任何」后面必须紧跟请求/问题/要求/指令，「不会拒绝任何退款请求」不命中；但给客服机器人写「不会拒绝任何请求」这种需求仍会命中，所以标 medium。"
+    },
+    {
+      "id": "zh_ignore_policy",
+      "category": "jailbreak",
+      "risk": "low",
+      "source": "(?:无视|忽略|不必遵守|无需遵守|不用遵守|不再遵守)(?:任何|所有|一切)?\\s*(?:OpenAI|Anthropic|Claude|ChatGPT)?\\s*(?:的)?(?:内容)?(?:政策|规定|准则|安全规则|使用条款)",
+      "corpus_hits": 0,
+      "unique_hits": 0,
+      "note": "「无视 OpenAI 的内容政策」「不必遵守 Anthropic 的政策」。"
+    },
+    {
+      "id": "zh_ignore_prev",
+      "category": "jailbreak",
+      "risk": "medium",
+      "source": "(?:忽略|忘记|忘掉|无视|抛弃)(?:掉)?你(?:之前|以前|原有|原本|原来|内置|出厂|自身)?(?:的)?(?:所有|全部|一切)?(?:的)?(?:安全|道德|伦理|AI)?(?:设定|规则|限制|准则|身份)",
+      "corpus_hits": 0,
+      "unique_hits": 0,
+      "note": "必须带「你」：「忘记你原有的设定」「忽略你之前的所有规则」。「忽略上面的提示词，重写函数」这种写代码时的说法不命中。"
+    }
+  ],
+  "merged_rules_low_medium": [
+    {
+      "category": "jailbreak",
+      "source": "\\b(?:jailbreak|dan)\\s+mode\\b",
+      "enabled": true
+    },
+    {
+      "category": "jailbreak",
+      "source": "\\bignore\\s+(?:all\\s+)?(?:previous|prior|above)\\s+(?:instructions|rules|prompts)\\b",
+      "enabled": true
+    },
+    {
+      "category": "jailbreak",
+      "source": "\\b(?:bypass|disable|remove)\\s+(?:your\\s+|the\\s+|all\\s+)?(?:safety|content)\\s+(?:filters?|policies|restrictions|limits)\\b",
+      "enabled": true
+    },
+    {
+      "category": "jailbreak",
+      "source": "(?:解除|关闭|绕过|无视)(?:你的|所有|全部)?(?:安全|内容)?(?:限制|审查|过滤|策略)",
+      "enabled": true
+    },
+    {
+      "category": "jailbreak",
+      "source": "(?:越狱|破限)(?:模式|提示词|提示|指令)",
+      "enabled": true
+    },
+    {
+      "category": "crack",
+      "source": "(?<![\\w-])(?:keygen|warez)(?![\\w-])",
+      "enabled": true
+    },
+    {
+      "category": "crack",
+      "source": "(?:破解补丁|注册机|激活码生成器)",
+      "enabled": true
+    },
+    {
+      "category": "crack",
+      "source": "\\bcrack(?:ing)?\\s+(?:this\\s+|the\\s+)?(?:software|license|drm|activation)\\b",
+      "enabled": true
+    },
+    {
+      "category": "nsfw",
+      "source": "\\b(?:write|generate|describe)\\s+(?:an?\\s+)?(?:explicit|pornographic)\\s+(?:sex|sexual)\\b",
+      "enabled": true
+    },
+    {
+      "category": "nsfw",
+      "source": "(?:生成|写一段|描述)(?:露骨|色情)(?:内容|小说|场景)",
+      "enabled": true
+    },
+    {
+      "category": "distill",
+      "source": "\\bdistill(?:ation|ing)?\\s+(?:of\\s+)?(?:(?:the|your|a|an|reusable|durable|rollout|hidden|internal|full|complete)\\s+)?(?:reasoning(?:\\s+traces?)?|chain[- ]of[- ]thoughts?|teacher(?:\\s+model)?)\\b",
+      "enabled": true
+    },
+    {
+      "category": "distill",
+      "source": "\\b(?:extract|export|dump|reveal|harvest|exfiltrate)(?:ing|ed|ion|s)?\\s+(?:(?:the|your|a|an|full|hidden|internal|complete|raw|durable|entire)\\s+){0,4}(?:chain[- ]of[- ]thoughts?|reasoning\\s+traces?|hidden\\s+reasoning|internal\\s+reasoning|internal\\s+monologues?)\\b",
+      "enabled": true
+    },
+    {
+      "category": "distill",
+      "source": "\\b(?:chain[- ]of[- ]thought|reasoning\\s+trace)\\s+extraction\\b",
+      "enabled": true
+    },
+    {
+      "category": "distill",
+      "source": "(?:思维链蒸馏|推理蒸馏|思考链蒸馏)",
+      "enabled": true
+    },
+    {
+      "category": "distill",
+      "source": "(?:提取|导出|抽取|蒸馏|收割|扒取)\\s*(?:出|取)?\\s*(?:你的|本人的|完整|全部|隐藏|内部)?\\s*(?:的)?\\s*(?:思维链|思考链|推理链)",
+      "enabled": true
+    },
+    {
+      "category": "distill",
+      "source": "(?:思维链|思考链|推理链)\\s*(?:的)?\\s*(?:提取|导出|抽取|蒸馏|收割)",
+      "enabled": true
+    },
+    {
+      "category": "distill",
+      "source": "(?:提取|导出|抽取)\\s*(?:出)?\\s*(?:隐藏|内部)\\s*(?:的)?\\s*(?:推理|思维|思考)",
+      "enabled": true
+    },
+    {
+      "category": "custom",
+      "source": "\\bphishing\\s+kit\\b",
+      "enabled": true
+    },
+    {
+      "category": "jailbreak",
+      "source": "(?:\\bdan\\b|stands\\s+for|belief\\s+of|motto\\s+(?:is|of)|\\bcan\\s+[\"“'])\\s*[:,(\"“'”]*\\s*do\\s+anything\\s+now\\b",
+      "enabled": true
+    },
+    {
+      "category": "jailbreak",
+      "source": "\\b(?:act|pretend|behave)\\s+(?:as|like|to\\s+be)\\s+(?:a\\s+|an\\s+)?(?:dan|stan|dude|aim|ucar|antigpt|betterdan|mongo\\s+tom)\\b",
+      "enabled": true
+    },
+    {
+      "category": "jailbreak",
+      "source": "\\bknowledge\\s+is\\s+cut\\s+off\\s+in\\s+2021\\b",
+      "enabled": true
+    },
+    {
+      "category": "jailbreak",
+      "source": "\\b(?:freed|free|released|broken\\s+free)\\s+(?:from|of)\\s+the\\s+typical\\s+confines\\s+of\\s+ai\\b",
+      "enabled": true
+    },
+    {
+      "category": "jailbreak",
+      "source": "(?:🔓|🔒)\\s*(?:jailbreak|classic|developer\\s+mode)",
+      "enabled": true
+    },
+    {
+      "category": "jailbreak",
+      "source": "\\b(?:with|in)\\s+(?:dan|developer|unrestricted)\\s+mode\\s+(?:enabled|activated)\\b|\\b(?:dan|developer|unrestricted|opposite)\\s+mode\\s+(?:output|policies|policy|response)s?\\b",
+      "enabled": true
+    },
+    {
+      "category": "jailbreak",
+      "source": "\\b(?:does\\s*n[o']t|do\\s*n[o']t|never|not|no\\s+longer)\\s+(?:have\\s+to\\s+|need\\s+to\\s+)?(?:abide\\s+by|adhere\\s+to|follow|comply\\s+with|bound\\s+by)\\s+(?:any\\s+|the\\s+)?(?:openai|anthropic|claude|chatgpt)(?:'s|s)?\\s+(?:content\\s+)?(?:polic(?:y|ies)|guidelines|rules|restrictions)\\b",
+      "enabled": true
+    },
+    {
+      "category": "jailbreak",
+      "source": "\\bwithout\\s+(?:any\\s+)?(?:ethical|moral|content)\\s+(?:or\\s+(?:moral|ethical)\\s+)?(?:guidelines|restrictions|filters|boundaries|constraints|limitations)\\b",
+      "enabled": true
+    },
+    {
+      "category": "jailbreak",
+      "source": "\\bunfiltered\\s+and\\s+amoral\\b|\\bamoral\\s+and\\s+unfiltered\\b",
+      "enabled": true
+    },
+    {
+      "category": "jailbreak",
+      "source": "\\bno\\s+matter\\s+how\\s+(?:dangerous|reckless|inhumane|immoral|unethical|illegal|offensive|harmful|explicit)[\\s,]+(?:or\\s+|and\\s+)?(?:dangerous|reckless|inhumane|immoral|unethical|illegal|offensive|harmful|explicit)\\b",
+      "enabled": true
+    },
+    {
+      "category": "jailbreak",
+      "source": "\\bnever\\s+(?:refuses?|declines?|denies|deny)\\s+(?:a\\s+direct\\s+(?:human\\s+)?order|any\\s+(?:of\\s+my\\s+|user\\s+)?(?:requests?|questions?|orders?|prompts?)(?!\\s+(?:with|under|over|that|which|for)))\\b|\\bnever\\s+refuse\\s+to\\s+answer\\b",
+      "enabled": true
+    },
+    {
+      "category": "jailbreak",
+      "source": "\\b(?:none\\s+of\\s+(?:your|his|her|its|\\w+'s)\\s+responses?|(?:your|its)\\s+responses?)\\s+(?:should|will|must|can)\\s*(?:n[o']t|never)?\\s*(?:contain|include)\\s+[\"“]?i'?m\\s+sorry",
+      "enabled": true
+    },
+    {
+      "category": "jailbreak",
+      "source": "\\b(?:always\\s+)?stay\\s+in\\s+character\\b[^.\\n]{0,40}\\b(?:no\\s+matter|even\\s+if|regardless|filter|polic|restriction)",
+      "enabled": true
+    },
+    {
+      "category": "jailbreak",
+      "source": "\\bignore\\s+all\\s+(?:the\\s+)?(?:instructions|rules|guidelines)\\s+you\\s+(?:got|received|were\\s+given|have\\s+been\\s+given)\\b",
+      "enabled": true
+    },
+    {
+      "category": "jailbreak",
+      "source": "\\balways\\s+intelligent\\s+and\\s+machiavellian\\b|\\bstrive\\s+to\\s+avoid\\s+norms\\b|\\bevil\\s+(?:trusted\\s+)?confidant\\b",
+      "enabled": true
+    },
+    {
+      "category": "jailbreak",
+      "source": "(?:没有|没有任何|不受|不受任何|摆脱(?:了)?(?:所有|一切)?)(?:道德|伦理|法律|内容|安全)?(?:的)?(?:限制|约束|束缚|审查)的\\s*(?:AI|人工智能|助手|模型|机器人)",
+      "enabled": true
+    },
+    {
+      "category": "jailbreak",
+      "source": "(?:无限制|DAN|无约束|越狱|无审查)\\s*模式(?:已)?(?:开启|启用|激活|输出)|(?:开启|启用|激活|进入|切换到)\\s*(?:无限制|DAN|无约束|越狱|无审查)\\s*模式",
+      "enabled": true
+    },
+    {
+      "category": "jailbreak",
+      "source": "(?:不会|不能|绝不|永远不|从不)(?:会)?拒绝(?:我的|用户的)?(?:任何|一切)(?:请求|问题|要求|指令)",
+      "enabled": true
+    },
+    {
+      "category": "jailbreak",
+      "source": "(?:无视|忽略|不必遵守|无需遵守|不用遵守|不再遵守)(?:任何|所有|一切)?\\s*(?:OpenAI|Anthropic|Claude|ChatGPT)?\\s*(?:的)?(?:内容)?(?:政策|规定|准则|安全规则|使用条款)",
+      "enabled": true
+    },
+    {
+      "category": "jailbreak",
+      "source": "(?:忽略|忘记|忘掉|无视|抛弃)(?:掉)?你(?:之前|以前|原有|原本|原来|内置|出厂|自身)?(?:的)?(?:所有|全部|一切)?(?:的)?(?:安全|道德|伦理|AI)?(?:设定|规则|限制|准则|身份)",
+      "enabled": true
+    }
+  ]
+}

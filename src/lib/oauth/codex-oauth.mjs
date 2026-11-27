@@ -12,13 +12,18 @@ import {
   CODEX_OAUTH_REDIRECT_URI,
   CODEX_OAUTH_SCOPE,
   exchangeCodexAuthorizationCode,
+  exchangeCodexAuthorizationCodeV2,
 } from '../protocol/codex-models.mjs'
 import { resolveSlotOAuthProxy } from '../vm/proxy-resolve.mjs'
+import { normalizeV2ProxyUrl } from './codex-auth-v2-client.mjs'
+import { OPENAI_OIDC_ISSUER, verifyOpenAiIdToken } from './openai-id-token-verify.mjs'
 
 export const CODEX_OAUTH_SESSION_TTL_MS = 10 * 60 * 1000
 const SURFACE_STABLE_ID_DOMAIN = Buffer.from('openai/codex-desktop/surface-stable-id/v1\0')
+const MAX_CALLBACK_URL_LENGTH = 16_384
 
 const sessions = new Map()
+const v2Sessions = new Map()
 
 function b64url(buf) {
   return Buffer.from(buf).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '')
@@ -181,6 +186,293 @@ export async function exchangeCodexAuthCode({
   }
 }
 
+function sweepExpiredV2(now = Date.now()) {
+  for (const [id, session] of v2Sessions) {
+    if (now >= session.expiresAtMs) {
+      session.codeVerifier = ''
+      v2Sessions.delete(id)
+    }
+  }
+}
+
+function equalSecret(a, b) {
+  const x = Buffer.from(String(a || ''), 'utf8')
+  const y = Buffer.from(String(b || ''), 'utf8')
+  return x.length === y.length && crypto.timingSafeEqual(x, y)
+}
+
+/**
+ * Strict Callback v2 URL validation:
+ *   - Exact origin + path `http://localhost:1455/auth/callback`
+ *   - No userinfo, fragment, backslash, control chars, or duplicate query keys
+ *   - Mandatory timing-safe `state` match
+ *   - Optional `iss` must equal `https://auth.openai.com`
+ *   - OAuth `error` rejects as `oauth_authorization_error`
+ *   - Non-empty `code` without whitespace or control characters
+ */
+export function validateCodexV2Callback(raw, expectedState) {
+  if (typeof raw !== 'string' || !raw || raw.length > MAX_CALLBACK_URL_LENGTH) {
+    throw fail('callback_invalid', '回调地址无效')
+  }
+  if (raw.includes('\\') || /[\r\n\t]/.test(raw)) {
+    throw fail('callback_invalid', '回调地址包含非法字符')
+  }
+  let u
+  try {
+    u = new URL(raw)
+  } catch {
+    throw fail('callback_invalid', '回调地址无法解析')
+  }
+  if (u.username || u.password || u.hash) {
+    throw fail('callback_invalid', '回调地址不允许包含用户信息或 fragment')
+  }
+  const seen = new Set()
+  for (const key of u.searchParams.keys()) {
+    if (seen.has(key)) throw fail('callback_invalid', '回调地址包含重复参数')
+    seen.add(key)
+  }
+  const base = new URL(CODEX_OAUTH_REDIRECT_URI)
+  if (u.origin !== base.origin || u.pathname !== base.pathname) {
+    throw fail('callback_invalid', '回调地址不匹配')
+  }
+  const gotState = u.searchParams.get('state')
+  if (!gotState || !expectedState || !equalSecret(gotState, expectedState)) {
+    throw fail('state_mismatch', '回调 state 与授权会话不匹配')
+  }
+  if (u.searchParams.has('iss') && u.searchParams.get('iss') !== OPENAI_OIDC_ISSUER) {
+    throw fail('callback_invalid', '回调 iss 不匹配')
+  }
+  if (u.searchParams.has('error')) {
+    throw fail('oauth_authorization_error', '上游 OAuth 返回错误')
+  }
+  const code = u.searchParams.get('code')
+  if (!code || /[\s\x00-\x1f]/.test(code)) {
+    throw fail('callback_invalid', '回调缺少合法授权码')
+  }
+  return { url: u.href, code }
+}
+
+/**
+ * Create a strict Callback v2 OAuth session keyed by lowercase `task_id`.
+ * Call ONLY after acquiring an execution slot so the 10-minute TTL is never spent queued.
+ */
+export function createCodexV2AuthSession({
+  taskId,
+  vmId,
+  email,
+  installationId,
+  boundExit,
+  expectedAccountId = null,
+  workspacePolicy = 'auto',
+  now = Date.now(),
+} = {}) {
+  sweepExpiredV2(now)
+  const id = String(taskId || '')
+    .trim()
+    .toLowerCase()
+  if (!id) throw fail('invalid_request', 'task_id required')
+  if (v2Sessions.has(id)) throw fail('task_already_running', 'task_id already exists')
+  const normalizedExit = normalizeV2ProxyUrl(boundExit)
+  if (!normalizedExit.ok) throw fail(normalizedExit.error, '槽位未绑定可用代理出口')
+  const state = b64url(crypto.randomBytes(32))
+  const codeVerifier = b64url(crypto.randomBytes(32))
+  const codeChallenge = b64url(crypto.createHash('sha256').update(codeVerifier).digest())
+  const install = String(installationId || crypto.randomUUID())
+  const expiresAtMs = now + CODEX_OAUTH_SESSION_TTL_MS
+  const expiresAtIso = new Date(expiresAtMs).toISOString()
+  const authUrl = buildDesktopAuthUrl({ state, codeChallenge, installationId: install })
+  v2Sessions.set(id, {
+    taskId: id,
+    vmId: vmId ? String(vmId) : null,
+    email: String(email || '')
+      .trim()
+      .toLowerCase(),
+    state,
+    codeVerifier,
+    boundExit: normalizedExit.value,
+    expectedAccountId: expectedAccountId ? String(expectedAccountId).trim() : null,
+    workspacePolicy: workspacePolicy || 'auto',
+    createdAt: now,
+    expiresAtMs,
+    expiresAtIso,
+    consumed: false,
+    canceled: false,
+  })
+  return {
+    task_id: id,
+    auth_url: authUrl,
+    expires_at_ms: expiresAtMs,
+    expires_at: expiresAtIso,
+    bound_exit: normalizedExit.value,
+  }
+}
+
+/** Atomically mark a Callback v2 session canceled and wipe its PKCE verifier. */
+export function cancelCodexV2AuthSession(taskId) {
+  const id = String(taskId || '')
+    .trim()
+    .toLowerCase()
+  const session = v2Sessions.get(id)
+  if (!session) return false
+  session.canceled = true
+  session.codeVerifier = ''
+  v2Sessions.delete(id)
+  return true
+}
+
+/**
+ * Consume a Callback v2 callback URL once:
+ *   1. Verify session is live, uncanceled, and unconsumed
+ *   2. Strictly validate callback URL and state
+ *   3. Check workspace consistency with `expectedAccountId` if present
+ *   4. Verify slot egress has not drifted since session creation
+ *   5. Atomically mark consumed BEFORE dispatching the single token exchange
+ *   6. Exchange code + PKCE verifier via the bound exit
+ *   7. Verify ID token cryptographically via OIDC/JWKS + email/workspace claims
+ *   8. Always clean up session and PKCE verifier in `finally`
+ */
+export async function consumeCodexV2Callback({
+  taskId,
+  callbackUrl,
+  selectedWorkspace = null,
+  resolveCurrentExit = null,
+  fetchImpl = null,
+  exchange = exchangeCodexAuthorizationCodeV2,
+  verify = verifyOpenAiIdToken,
+  signal = null,
+  onProgress = null,
+  now = () => Date.now(),
+} = {}) {
+  const id = String(taskId || '')
+    .trim()
+    .toLowerCase()
+  const session = v2Sessions.get(id)
+  if (!session) return { ok: false, error: 'expired' }
+  if (session.canceled || signal?.aborted) {
+    cancelCodexV2AuthSession(id)
+    return { ok: false, error: 'canceled' }
+  }
+  if (session.consumed) {
+    return { ok: false, error: 'task_already_finished' }
+  }
+  const remainingMs = session.expiresAtMs - now()
+  if (remainingMs <= 0) {
+    session.codeVerifier = ''
+    v2Sessions.delete(id)
+    return { ok: false, error: 'expired' }
+  }
+
+  let parsed
+  try {
+    parsed = validateCodexV2Callback(callbackUrl, session.state)
+  } catch (err) {
+    session.codeVerifier = ''
+    v2Sessions.delete(id)
+    return { ok: false, error: err?.code || 'callback_invalid' }
+  }
+
+  if (selectedWorkspace && session.expectedAccountId && selectedWorkspace.id !== session.expectedAccountId) {
+    session.codeVerifier = ''
+    v2Sessions.delete(id)
+    return { ok: false, error: 'identity_mismatch' }
+  }
+
+  if (typeof resolveCurrentExit === 'function') {
+    let currentExit
+    try {
+      currentExit = resolveCurrentExit()
+    } catch (err) {
+      session.codeVerifier = ''
+      v2Sessions.delete(id)
+      return { ok: false, error: err?.code || 'proxy_unavailable' }
+    }
+    const normalizedCurrent = normalizeV2ProxyUrl(currentExit)
+    if (!normalizedCurrent.ok) {
+      session.codeVerifier = ''
+      v2Sessions.delete(id)
+      return { ok: false, error: 'proxy_unavailable' }
+    }
+    if (normalizedCurrent.value !== session.boundExit) {
+      session.codeVerifier = ''
+      v2Sessions.delete(id)
+      return { ok: false, error: 'proxy_changed' }
+    }
+  }
+
+  // Atomic single-use claim BEFORE any network I/O.
+  session.consumed = true
+  const verifier = session.codeVerifier
+  const boundExit = session.boundExit
+  const expectedEmail = session.email
+  const targetAccountId = selectedWorkspace?.id || session.expectedAccountId || null
+
+  const deadlineAc = new AbortController()
+  const deadlineTimer = setTimeout(() => deadlineAc.abort(), Math.max(1, remainingMs))
+  const combinedSignal = signal ? AbortSignal.any([deadlineAc.signal, signal]) : deadlineAc.signal
+
+  try {
+    try {
+      onProgress?.('exchanging_token')
+    } catch {}
+    const tok = await exchange({
+      code: parsed.code,
+      codeVerifier: verifier,
+      proxyUrl: boundExit,
+      fetchImpl: fetchImpl || undefined,
+      signal: combinedSignal,
+      timeoutMs: Math.min(60_000, Math.max(3_000, remainingMs)),
+    })
+    if (signal?.aborted || session.canceled) return { ok: false, error: 'canceled' }
+    if (deadlineAc.signal.aborted && !tok?.ok) return { ok: false, error: tok?.error || 'exchange_outcome_unknown' }
+    if (!tok?.ok) {
+      return { ok: false, error: tok?.error || 'exchange_rejected', ...(tok?.status ? { status: tok.status } : {}) }
+    }
+
+    try {
+      onProgress?.('verifying_identity')
+    } catch {}
+    const verified = await verify({
+      idToken: tok.id_token,
+      expectedEmail,
+      expectedAccountId: targetAccountId,
+      proxyUrl: boundExit,
+      fetchImpl: fetchImpl || undefined,
+      signal: combinedSignal,
+      timeoutMs: Math.min(30_000, Math.max(3_000, session.expiresAtMs - now())),
+      now,
+    })
+    if (signal?.aborted || session.canceled) return { ok: false, error: 'canceled' }
+    if (!verified?.ok) {
+      return { ok: false, error: verified?.error || 'token_verification_failed' }
+    }
+
+    return {
+      ok: true,
+      verified: true,
+      credential: {
+        access_token: tok.access_token,
+        refresh_token: tok.refresh_token,
+        id_token: tok.id_token,
+        expires_at: tok.expires_at,
+        email: verified.email,
+        chatgpt_account_id: verified.chatgpt_account_id,
+      },
+      email: verified.email,
+      chatgpt_account_id: verified.chatgpt_account_id,
+    }
+  } finally {
+    clearTimeout(deadlineTimer)
+    session.codeVerifier = ''
+    v2Sessions.delete(id)
+  }
+}
+
+export function resetCodexV2AuthSessions() {
+  for (const session of v2Sessions.values()) session.codeVerifier = ''
+  v2Sessions.clear()
+}
+
 export function resetCodexAuthUrlSessions() {
   sessions.clear()
+  resetCodexV2AuthSessions()
 }

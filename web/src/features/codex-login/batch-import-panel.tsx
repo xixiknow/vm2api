@@ -9,6 +9,13 @@ import { Checkbox } from '@/components/ui/checkbox'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
+import {
   Table,
   TableBody,
   TableCell,
@@ -17,17 +24,18 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import { Textarea } from '@/components/ui/textarea'
-import { ChoiceTiles } from '@/components/choice-tiles'
 import { ConfirmDialog } from '@/components/confirm-dialog'
 import { StatusMark } from '@/components/status-mark'
 import { dashboardQueryOptions } from '@/features/overview/queries'
 import {
+  WORKSPACE_POLICY_OPTIONS,
   batchSummary,
   batchTextProblem,
   checkBatchText,
   codexLoginCodeText,
   codexLoginErrorText,
   codexLoginWarningText,
+  codexWorkspaceSummary,
   hasRetryableRows,
   rowTone,
 } from './batch-text'
@@ -36,24 +44,9 @@ import {
   codexLoginBatchQueryOptions,
   codexLoginServiceQueryOptions,
 } from './queries'
-import type { CodexLoginBatch } from './types'
+import type { CodexLoginBatch, CodexWorkspacePolicy } from './types'
 
-type ExitMode = 'pool' | 'local'
-
-const EXIT_CHOICES: { value: ExitMode; title: string; detail: string }[] = [
-  {
-    value: 'pool',
-    title: '代理池自动分配',
-    detail: '每个账号分一个空闲 SOCKS5，登录和推理走同一个出口。',
-  },
-  {
-    value: 'local',
-    title: '本机出口',
-    detail: '走这台机器的网络。没有部署代理时，登录服务会用它自己的 IP。',
-  },
-]
-
-/** 导入页「批量登录导入」：每行一个账号，服务端逐个登录、建槽、导入。 */
+/** 导入页「批量登录导入」：每行一个账号，仅走代理池自动分配，排队后逐个登录、换票验签并落盘。 */
 export function CodexLoginBatchPanel() {
   const qc = useQueryClient()
   const service = useQuery(codexLoginServiceQueryOptions())
@@ -61,9 +54,12 @@ export function CodexLoginBatchPanel() {
   // 输入框不进 React 状态：密码只在 DOM 里，提交后立刻清掉。
   const textRef = useRef<HTMLTextAreaElement>(null)
   const [problem, setProblem] = useState('')
-  const [exitMode, setExitMode] = useState<ExitMode>('pool')
+  const [pastedCount, setPastedCount] = useState(0)
   const [saveLogin, setSaveLogin] = useState(true)
   const [prefix, setPrefix] = useState('')
+  const [policyOverride, setPolicyOverride] = useState<
+    CodexWorkspacePolicy | ''
+  >('')
   const [confirmClear, setConfirmClear] = useState(false)
 
   const batch = batchQuery.data ?? null
@@ -71,8 +67,15 @@ export function CodexLoginBatchPanel() {
   const configured = !!service.data?.configured
   const encryption = service.data?.encryption_enabled !== false
   const blockedBySecret = saveLogin && !encryption
+  const egress = service.data?.egress_summary ?? null
+  const freeSlots = egress?.pool_free_slots ?? null
+  const noFreeProxy = service.isSuccess && freeSlots !== null && freeSlots <= 0
+  const exceedsFreeSlots =
+    freeSlots !== null && freeSlots > 0 && pastedCount > freeSlots
+  const effectivePolicy: CodexWorkspacePolicy =
+    policyOverride || service.data?.workspace_policy || 'auto'
 
-  // Polling stops when the batch ends: that is the moment new slots exist.
+  // Polling stops when the batch ends: refresh slots and remaining proxy counts.
   const wasRunning = useRef(false)
   useEffect(() => {
     if (running) {
@@ -82,12 +85,20 @@ export function CodexLoginBatchPanel() {
     if (!wasRunning.current) return
     wasRunning.current = false
     void qc.invalidateQueries({ queryKey: dashboardQueryOptions().queryKey })
+    void qc.invalidateQueries({
+      queryKey: codexLoginServiceQueryOptions().queryKey,
+    })
   }, [running, qc])
 
   const store = (data: CodexLoginBatch | null) =>
     qc.setQueryData(codexLoginBatchQueryOptions().queryKey, data)
-  const refreshSlots = () =>
-    qc.invalidateQueries({ queryKey: dashboardQueryOptions().queryKey })
+  const refreshAll = () =>
+    Promise.all([
+      qc.invalidateQueries({ queryKey: dashboardQueryOptions().queryKey }),
+      qc.invalidateQueries({
+        queryKey: codexLoginServiceQueryOptions().queryKey,
+      }),
+    ])
 
   const start = useMutation({
     gcTime: 0,
@@ -96,13 +107,14 @@ export function CodexLoginBatchPanel() {
         method: 'POST',
         body: JSON.stringify({
           text: textRef.current?.value || '',
-          exit_mode: exitMode,
           save_login: saveLogin,
           name_prefix: prefix.trim(),
+          workspace_policy: effectivePolicy,
         }),
       }),
     onSuccess: (data) => {
       if (textRef.current) textRef.current.value = ''
+      setPastedCount(0)
       store(data)
       toast.success(`已开始导入 ${data.rows.length} 个账号`)
     },
@@ -116,7 +128,7 @@ export function CodexLoginBatchPanel() {
       }),
     onSuccess: async (data, vars) => {
       store(vars.method === 'DELETE' ? null : data)
-      await refreshSlots()
+      await refreshAll()
     },
     onError: (error) => toast.error(codexLoginErrorText(error)),
   })
@@ -139,17 +151,19 @@ export function CodexLoginBatchPanel() {
     <div className='space-y-5'>
       <p className='max-w-[68ch] text-sm leading-relaxed text-muted-foreground'>
         每行一个 GPT 账号：
-        <code className='font-mono'>邮箱----密码----2FA密钥</code>
-        （也可用逗号分隔）。2FA 填长期密钥，不是六位验证码。每个账号建一个新 GPT
-        槽，先分配出口，再通过登录服务登录拿令牌。已在某个槽里的账号会跳过。
+        <code className='font-mono'>邮箱----密码----2FA密钥</code> 或{' '}
+        <code className='font-mono'>邮箱----密码</code>
+        （也可用逗号分隔，无 2FA 可省略第 3 列；2FA 填长期 Base32 密钥或{' '}
+        <code className='font-mono'>otpauth://</code>，不是六位验证码）。
+        每个账号自动从代理池分配非本机出口，登录、换票与推理走同一代理，已在其他槽里的账号会跳过。
       </p>
 
       {service.isSuccess && !configured ? (
         <Alert>
-          <AlertTitle>还没有配置登录服务</AlertTitle>
+          <AlertTitle>还没有配置认证服务</AlertTitle>
           <AlertDescription>
             <span>
-              密码登录交给外部登录服务完成。先在{' '}
+              先在{' '}
               <Link
                 to='/settings/$tab'
                 params={{ tab: 'gptlogin' }}
@@ -157,7 +171,22 @@ export function CodexLoginBatchPanel() {
               >
                 设置 → GPT 登录
               </Link>{' '}
-              填好服务地址。
+              填好 Callback v2 认证服务地址与服务密钥。
+            </span>
+          </AlertDescription>
+        </Alert>
+      ) : null}
+
+      {noFreeProxy ? (
+        <Alert variant='destructive'>
+          <AlertTitle>代理池没有空闲出口</AlertTitle>
+          <AlertDescription>
+            <span>
+              批量导入要求每个账号绑定代理池中的非本机代理。当前无可用空闲名额，请先前往{' '}
+              <Link to='/proxies' className='underline underline-offset-4'>
+                代理池
+              </Link>{' '}
+              添加、启用代理或调大单代理绑定上限。
             </span>
           </AlertDescription>
         </Alert>
@@ -165,6 +194,14 @@ export function CodexLoginBatchPanel() {
 
       {running ? null : (
         <div className='space-y-4'>
+          {egress && !noFreeProxy ? (
+            <p className='text-xs text-muted-foreground tabular-nums'>
+              当前代理池可用代理 {egress.pool_usable_proxies} 条 ·
+              剩余空闲绑定名额 {egress.pool_free_slots} 个（单代理最多{' '}
+              {egress.bind_limit}{' '}
+              槽；同代理并发登录自动串行防撞，遇到不可达代理本轮自动避让）。
+            </p>
+          ) : null}
           <Textarea
             ref={textRef}
             className='h-44 font-mono text-[13px] leading-relaxed'
@@ -173,9 +210,15 @@ export function CodexLoginBatchPanel() {
             autoCorrect='off'
             autoCapitalize='off'
             aria-label='账号列表'
-            placeholder={'user@example.com----密码----JBSWY3DPEHPK3PXP'}
+            placeholder={
+              'user1@example.com----密码----JBSWY3DPEHPK3PXP\nuser2@example.com----无2FA密码'
+            }
             disabled={start.isPending}
-            onChange={() => problem && setProblem('')}
+            onChange={(e) => {
+              if (problem) setProblem('')
+              const checked = checkBatchText(e.target.value)
+              setPastedCount(checked.ok ? checked.count : 0)
+            }}
             onKeyDown={(e) => {
               if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') submit()
             }}
@@ -183,12 +226,13 @@ export function CodexLoginBatchPanel() {
           {problem ? (
             <p className='text-xs text-destructive'>{problem}</p>
           ) : null}
-          <ChoiceTiles
-            label='出口'
-            value={exitMode}
-            onChange={setExitMode}
-            choices={EXIT_CHOICES}
-          />
+          {exceedsFreeSlots ? (
+            <p className='text-xs text-[color:var(--status-warn)]'>
+              已粘贴 {pastedCount} 个账号，但代理池仅剩 {freeSlots}{' '}
+              个空闲绑定名额；超出部分（除已存在跳过的账号外）将因无空闲出口失败。
+            </p>
+          ) : null}
+
           <div className='flex flex-wrap items-end gap-x-6 gap-y-3'>
             <div className='grid gap-1.5'>
               <Label htmlFor='codex-login-prefix'>槽名前缀（可选）</Label>
@@ -200,6 +244,29 @@ export function CodexLoginBatchPanel() {
                 onChange={(e) => setPrefix(e.target.value)}
                 placeholder='槽名默认用邮箱'
               />
+            </div>
+            <div className='grid gap-1.5'>
+              <Label htmlFor='codex-batch-workspace-policy'>工作区偏好</Label>
+              <Select
+                value={effectivePolicy}
+                onValueChange={(v) =>
+                  setPolicyOverride(v as CodexWorkspacePolicy)
+                }
+              >
+                <SelectTrigger
+                  id='codex-batch-workspace-policy'
+                  className='w-56'
+                >
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {WORKSPACE_POLICY_OPTIONS.map((opt) => (
+                    <SelectItem key={opt.value} value={opt.value}>
+                      {opt.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
             </div>
             <label className='flex items-center gap-2 pb-2 text-sm'>
               <Checkbox
@@ -219,7 +286,9 @@ export function CodexLoginBatchPanel() {
             <Button
               onClick={submit}
               loading={start.isPending}
-              disabled={!configured || blockedBySecret || start.isPending}
+              disabled={
+                !configured || noFreeProxy || blockedBySecret || start.isPending
+              }
             >
               登录并导入
             </Button>
@@ -307,7 +376,7 @@ export function CodexLoginBatchPanel() {
                     {row.email}
                   </TableCell>
                   <TableCell>
-                    <StatusMark tone={rowTone(row.status)} />
+                    <StatusMark tone={rowTone(row.status, row.stage)} />
                   </TableCell>
                   <TableCell>
                     {row.vm_id ? (
@@ -325,6 +394,9 @@ export function CodexLoginBatchPanel() {
                   <TableCell className='max-w-[28rem] text-xs text-muted-foreground'>
                     {[
                       codexLoginCodeText(row.error, row.detail),
+                      row.status === 'created'
+                        ? codexWorkspaceSummary(row.workspace)
+                        : '',
                       codexLoginWarningText(row.warning),
                     ]
                       .filter(Boolean)
@@ -336,7 +408,7 @@ export function CodexLoginBatchPanel() {
           </Table>
           <p className='text-xs text-muted-foreground'>
             {running
-              ? '批次在服务端运行，离开页面不影响。停止会中断正在进行的登录并删掉它的空槽。'
+              ? '批次在服务端运行，离开页面不影响。停止会中断正在进行的登录、取消远端任务并释放空槽与代理。'
               : `结果保留 30 分钟。失败行的密码只在服务端内存里留到过期，「重试未完成」不用重新粘贴。${
                   finishedRows.length ? '已导入的槽在虚拟机列表里。' : ''
                 }`}

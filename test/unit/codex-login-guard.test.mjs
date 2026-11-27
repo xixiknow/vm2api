@@ -146,7 +146,13 @@ function guardSetup(t, { verdicts = {}, config } = {}) {
         return { ok: true }
       },
     },
-    readConfig: () => config || { endpoint: 'https://login.test', guard_enabled: true, guard: { fail_threshold: 2 } },
+    readConfig: () =>
+      config || {
+        endpoint: 'http://127.0.0.1:8788',
+        service_token: 'tok-guard',
+        guard_enabled: true,
+        guard: { fail_threshold: 2 },
+      },
     getVm: (id) => vms[id] || null,
     isCodexVm: (vm) => vm.platform === 'openai',
     probe: async (vm) => {
@@ -205,9 +211,13 @@ test('guard: nudged slots go first; paused, off and non-GPT slots are skipped', 
   assert.deepEqual(calls.probe, [])
 })
 
-test('guard: off when the guard or the service is not configured', async (t) => {
-  const off = guardSetup(t, { config: { endpoint: 'https://login.test', guard_enabled: false } })
+test('guard: off when the guard or the service is not configured (including missing token)', async (t) => {
+  const off = guardSetup(t, {
+    config: { endpoint: 'http://127.0.0.1:8788', service_token: 'tok', guard_enabled: false },
+  })
   assert.equal((await off.guard.tick()).probed, 0)
   const noService = guardSetup(t, { config: { endpoint: '', guard_enabled: true } })
   assert.equal((await noService.guard.tick()).probed, 0)
+  const noToken = guardSetup(t, { config: { endpoint: 'http://127.0.0.1:8788', guard_enabled: true } })
+  assert.equal((await noToken.guard.tick()).probed, 0)
 })

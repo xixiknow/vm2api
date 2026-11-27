@@ -403,10 +403,10 @@ function VmDetailBody({
   )
   const todayInput = Number(
     acc.today_input_tokens ??
-    vm.today_input_tokens ??
-    acc.tokens_in ??
-    vm.tokens_in ??
-    0
+      vm.today_input_tokens ??
+      acc.tokens_in ??
+      vm.tokens_in ??
+      0
   )
   const todayHit = cacheHitPct(todayInput, todayReadCache, todayWriteCache)
   const today = vmTodayCounts(vm, data.billing)

@@ -21,6 +21,7 @@ import {
   vmWeekOutcome,
 } from '@/lib/vm-usage'
 import { Button } from '@/components/ui/button'
+import { IqTimeline24h } from '@/features/gpt-iq/iq-badge'
 import { vmHealthQueryOptions, type VmHealthRange } from './queries'
 import { riskFg } from './usage-meter'
 import {
@@ -208,6 +209,7 @@ function HealthCard({ vm }: { vm: Vm }) {
               </div>
             )}
           </div>
+          <IqTimeline24h vm={vm} />
         </>
       )}
     </section>

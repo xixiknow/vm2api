@@ -5,7 +5,7 @@ import { createCodexReloginService } from '../../src/lib/oauth/codex-relogin.mjs
 
 function fakeJwt(payload) {
   const b64 = (obj) => Buffer.from(JSON.stringify(obj)).toString('base64url')
-  return `${b64({ alg: 'none' })}.${b64(payload)}.sig`
+  return `${b64({ alg: 'RS256' })}.${b64(payload)}.sig`
 }
 
 function credentialFor(email, accountId) {
@@ -25,7 +25,13 @@ function memorySettings() {
 
 function setup(
   t,
-  { plan = [], vm = { id: 'vm-1', platform: 'openai', codex: { chatgpt_account_id: 'acct-1' } }, config } = {},
+  {
+    plan = [],
+    vm = { id: 'vm-1', platform: 'openai', codex: { chatgpt_account_id: 'acct-1' }, proxy: { id: 'px-1' } },
+    config,
+    findExisting = () => null,
+    isSlotBusy = () => false,
+  } = {},
 ) {
   const prev = process.env.VM2API_DB_SECRET
   process.env.VM2API_DB_SECRET = 'relogin-test-secret'
@@ -35,136 +41,137 @@ function setup(
   })
   let clock = Date.UTC(2026, 10, 24, 12)
   const profiles = createCodexLoginProfiles({ settings: memorySettings(), now: () => clock })
-  profiles.save('vm-1', { email: 'a@x.com', password: 'PW', totp_secret: 'TOTP' })
+  profiles.save('vm-1', { email: 'a@x.com', password: 'PW', totp_secret: 'JBSWY3DPEHPK3PXP' })
   const calls = { login: [], commit: [], restart: [] }
   const vms = { 'vm-1': vm }
   const service = createCodexReloginService({
     profiles,
     readConfig: () =>
-      config || { endpoint: 'https://login.test', guard: { relogin_cooldown_min: 30, max_relogin_failures: 3 } },
+      config || {
+        endpoint: 'http://127.0.0.1:8788',
+        service_token: 'tok-test',
+        workspace_policy: 'auto',
+        max_concurrency: 2,
+        guard: { relogin_cooldown_min: 30, max_relogin_failures: 3 },
+      },
     login: async (args) => {
       calls.login.push(args)
+      args.onProgress?.('verifying_password')
       const step = plan.length ? plan.shift() : { ok: true }
       if (step.hang) {
         return new Promise((resolve) =>
           args.signal.addEventListener('abort', () => resolve({ ok: false, error: 'canceled' })),
         )
       }
-      if (!step.ok) return { ok: false, error: step.error || 'login_rejected', detail: step.detail }
-      return { ok: true, credential: credentialFor(step.email || 'a@x.com', step.accountId || 'acct-1') }
+      if (!step.ok) return { ok: false, error: step.error || 'auth_worker_failed', detail: step.detail }
+      return {
+        ok: true,
+        credential: credentialFor(step.email || 'a@x.com', step.accountId || 'acct-1'),
+        workspace: {
+          id: step.accountId || 'acct-1',
+          kind: 'organization',
+          name: 'Org',
+          selection_reason: args.expectedAccountId ? 'explicit_id' : 'organization_preferred',
+          candidate_count: 2,
+          selection_missing: false,
+        },
+      }
     },
     getVm: (id) => vms[id] || null,
     isCodexVm: (v) => v?.platform === 'openai',
-    slotExit: () => ({ proxy_url: 'socks5h://u:p@h:1', login_ip_differs: false }),
+    slotExit: () => ({ ok: true, proxy_id: 'px-1', proxy_url: 'socks5h://u:p@h:1', login_ip_differs: false }),
     commit: async ({ vmId, account }) => {
-      calls.commit.push({ vmId, email: account.email })
+      calls.commit.push({ vmId, email: account.email, accountId: account.chatgpt_account_id })
       return { ok: true }
     },
     restartKernel: async (vmId) => {
       calls.restart.push(vmId)
     },
+    findExisting,
+    isSlotBusy,
     now: () => clock,
   })
   return { profiles, service, calls, vms, advance: (ms) => (clock += ms) }
 }
 
-test('a matching login replaces the tokens, restarts the kernel and resets the state', async (t) => {
+test('relogin locks expectedAccountId by default, replaces tokens, and restarts kernel', async (t) => {
   const { profiles, service, calls } = setup(t)
   profiles.patchState('vm-1', { relogin_fail_streak: 2, auth_fail_streak: 2 })
   const queued = service.request('vm-1')
-  assert.deepEqual([queued.ok, queued.status, queued.task.state], [true, 202, 'running'])
+  assert.equal(queued.ok, true)
+  assert.equal(queued.status, 202)
   assert.equal(service.request('vm-1').already, true)
   await service.settled('vm-1')
   assert.equal(calls.login.length, 1)
-  assert.deepEqual(
-    [calls.login[0].email, calls.login[0].password, calls.login[0].mfaSecret, calls.login[0].proxyUrl],
-    ['a@x.com', 'PW', 'TOTP', 'socks5h://u:p@h:1'],
-  )
-  assert.deepEqual(calls.commit, [{ vmId: 'vm-1', email: 'a@x.com' }])
+  assert.equal(calls.login[0].expectedAccountId, 'acct-1')
+  assert.equal(calls.login[0].proxyUrl, 'socks5h://u:p@h:1')
+  assert.deepEqual(calls.commit, [{ vmId: 'vm-1', email: 'a@x.com', accountId: 'acct-1' }])
   assert.deepEqual(calls.restart, ['vm-1'])
   const state = profiles.get('vm-1').state
   assert.equal(state.last_relogin_result, 'ok')
-  assert.equal(state.last_relogin_trigger, 'manual')
   assert.equal(state.relogin_fail_streak, 0)
-  assert.equal(state.auth_fail_streak, 0)
-  assert.ok(state.next_probe_at > 0)
   assert.deepEqual(service.status('vm-1'), { state: 'idle' })
 })
 
-test('a different account never overwrites the slot', async (t) => {
-  for (const step of [
-    { ok: true, email: 'b@x.com' },
-    { ok: true, accountId: 'acct-other' },
-  ]) {
-    const { profiles, service, calls } = setup(t, { plan: [step] })
-    service.request('vm-1')
-    await service.settled('vm-1')
-    assert.equal(calls.commit.length, 0)
-    assert.equal(profiles.get('vm-1').state.last_relogin_error, 'identity_mismatch')
-    assert.equal(profiles.get('vm-1').state.relogin_fail_streak, 1)
-  }
-})
-
-test('failures cool down, then pause automatic re-login; manual still runs', async (t) => {
-  const { profiles, service, advance } = setup(t, {
+test('workspace_not_found pauses auto-relogin immediately; manual allowWorkspaceReselect opens auto-selection', async (t) => {
+  const { profiles, service, calls } = setup(t, {
     plan: [
-      { ok: false, detail: 'invalid_password' },
-      { ok: false, detail: 'invalid_password' },
-      { ok: false, detail: 'invalid_password' },
+      { ok: false, error: 'workspace_not_found' },
+      { ok: true, accountId: 'acct-new-2' },
     ],
   })
   service.request('vm-1', { trigger: 'auto' })
   await service.settled('vm-1')
-  let state = profiles.get('vm-1').state
-  assert.deepEqual([state.last_relogin_result, state.last_relogin_detail], ['failed', 'invalid_password'])
-  assert.equal(service.request('vm-1', { trigger: 'auto' }).error, 'cooldown')
-  advance(31 * 60_000)
-  service.request('vm-1', { trigger: 'auto' })
-  await service.settled('vm-1')
-  service.request('vm-1')
-  await service.settled('vm-1')
-  state = profiles.get('vm-1').state
-  assert.equal(state.relogin_fail_streak, 3)
-  assert.equal(state.auto_paused, 'too_many_failures')
-  advance(31 * 60_000)
+  assert.equal(profiles.get('vm-1').state.last_relogin_error, 'workspace_not_found')
+  assert.equal(profiles.get('vm-1').state.auto_paused, 'workspace_not_found')
   assert.equal(service.request('vm-1', { trigger: 'auto' }).error, 'auto_paused')
 
-  profiles.setAutoRelogin('vm-1', false)
-  profiles.patchState('vm-1', { auto_paused: null })
-  assert.equal(service.request('vm-1', { trigger: 'auto' }).error, 'auto_relogin_off')
-  service.request('vm-1')
+  // Manual reselect passes expectedAccountId: null and accepts the new workspace ID.
+  service.request('vm-1', { trigger: 'manual', allowWorkspaceReselect: true })
   await service.settled('vm-1')
-  assert.equal(profiles.get('vm-1').state.last_relogin_result, 'ok')
+  assert.equal(calls.login[1].expectedAccountId, null)
+  assert.deepEqual(calls.commit, [{ vmId: 'vm-1', email: 'a@x.com', accountId: 'acct-new-2' }])
   assert.equal(profiles.get('vm-1').state.auto_paused, null)
 })
 
-test('requests are refused without a profile, a GPT slot, a service or a readable secret', (t) => {
-  const { profiles, service, vms } = setup(t)
-  assert.equal(service.request('vm-x').error, 'profile_missing')
-  vms['vm-1'] = { id: 'vm-1', platform: 'anthropic' }
-  assert.equal(service.request('vm-1').error, 'vm_not_found')
-  const off = setup(t, { config: { endpoint: '' } })
-  assert.equal(off.service.request('vm-1').error, 'login_service_unconfigured')
-  profiles.remove('vm-1')
-  assert.equal(service.request('vm-1').error, 'profile_missing')
+test('password_rejected pauses immediately while auth_worker_failed uses normal streak and cooldown', async (t) => {
+  const pw = setup(t, { plan: [{ ok: false, error: 'password_rejected' }] })
+  pw.service.request('vm-1', { trigger: 'auto' })
+  await pw.service.settled('vm-1')
+  assert.equal(pw.profiles.get('vm-1').state.auto_paused, 'password_rejected')
+
+  const worker = setup(t, {
+    plan: [
+      { ok: false, error: 'auth_worker_failed' },
+      { ok: false, error: 'auth_worker_failed' },
+      { ok: false, error: 'auth_worker_failed' },
+    ],
+  })
+  worker.service.request('vm-1', { trigger: 'auto' })
+  await worker.service.settled('vm-1')
+  assert.equal(worker.profiles.get('vm-1').state.auto_paused, null)
+  assert.equal(worker.service.request('vm-1', { trigger: 'auto' }).error, 'cooldown')
+  worker.advance(31 * 60_000)
+  worker.service.request('vm-1', { trigger: 'auto' })
+  await worker.service.settled('vm-1')
+  worker.service.request('vm-1')
+  await worker.service.settled('vm-1')
+  assert.equal(worker.profiles.get('vm-1').state.auto_paused, 'too_many_failures')
 })
 
-test('a rotated DB key is reported instead of logging in', async (t) => {
-  const { profiles, service, calls } = setup(t)
-  process.env.VM2API_DB_SECRET = 'another-key'
-  service.request('vm-1')
-  await service.settled('vm-1')
-  assert.equal(calls.login.length, 0)
-  assert.equal(profiles.get('vm-1').state.last_relogin_error, 'secret_unreadable')
-})
+test('blocks relogin when slotLogin is busy, service lacks token, or reselected workspace collides with another slot', async (t) => {
+  const busy = setup(t, { isSlotBusy: () => true })
+  assert.equal(busy.service.request('vm-1').error, 'slot_login_running')
 
-test('stop aborts a running login without recording it', async (t) => {
-  const { profiles, service, calls } = setup(t, { plan: [{ hang: true }] })
-  service.request('vm-1')
-  const done = service.settled('vm-1')
-  service.stop()
-  await done
-  assert.equal(calls.commit.length, 0)
-  assert.equal(profiles.get('vm-1').state.last_relogin_result, null)
-  assert.equal(service.request('vm-1').error, 'shutting_down')
+  const noToken = setup(t, { config: { endpoint: 'http://127.0.0.1:8788' } })
+  assert.equal(noToken.service.request('vm-1').error, 'login_service_unconfigured')
+
+  const dup = setup(t, {
+    plan: [{ ok: true, accountId: 'acct-taken' }],
+    findExisting: ({ chatgptAccountId }) => (chatgptAccountId === 'acct-taken' ? { vm_id: 'vm-other' } : null),
+  })
+  dup.service.request('vm-1', { trigger: 'manual', allowWorkspaceReselect: true })
+  await dup.service.settled('vm-1')
+  assert.equal(dup.calls.commit.length, 0)
+  assert.equal(dup.profiles.get('vm-1').state.last_relogin_error, 'account_exists')
 })

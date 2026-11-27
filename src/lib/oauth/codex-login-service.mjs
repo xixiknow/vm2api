@@ -1,51 +1,46 @@
 /**
- * External login service for GPT (Codex) slots: email + password + TOTP secret → OAuth tokens.
+ * External login service for GPT (Codex) slots using the `codex-auth-service` Callback v2 protocol.
  *
- * Protocol (sub2api relogin endpoint, plus `proxy`):
- *   POST {endpoint} {"action":"start","email","auth_mode":"password_2fa","password","mfa_secret","proxy"?}
- *   → NDJSON events or one JSON value. The first `{type:"result",payload}`, or object carrying
- *     `credential` / `error` / a terminal `status`, decides the outcome; heartbeats are skipped.
+ * Flow:
+ *   1. Caller acquires a concurrency permit in the global queue.
+ *   2. vm2api generates a strict PKCE/state OAuth session bound to the slot's proxy exit.
+ *   3. POST {endpoint}/v2/authenticate (Bearer token, NDJSON progress/heartbeat stream) → callback_url.
+ *   4. vm2api strictly validates callback URL + state + exit consistency, consumes the session once,
+ *      exchanges code + verifier directly with auth.openai.com via the same slot proxy, and
+ *      cryptographically verifies the ID token via OIDC discovery/JWKS + email/workspace claims.
  *
- * The service receives the account password, the long-lived TOTP secret and the slot's proxy
- * credentials, so it must be self-hosted or fully trusted. Nothing here logs or echoes them:
- * failures surface as short codes only.
+ * Nothing here logs or echoes passwords, TOTP secrets, Bearer tokens, proxy credentials,
+ * authorization codes, or PKCE verifiers.
  */
 import crypto from 'node:crypto'
-import net from 'node:net'
 import nodeFetch from 'node-fetch'
 import { encryptionEnabled, maybeDecrypt, maybeEncrypt } from '../db/secure.mjs'
 import { parseCodexCredentialInput } from '../vm/codex-slot.mjs'
+import {
+  DEFAULT_IDLE_TIMEOUT_MS,
+  SELECTION_REASONS,
+  WORKSPACE_KINDS,
+  WORKSPACE_POLICIES,
+  authenticateWithV2Service,
+  checkAuthV2ServiceHealth,
+  isPrivateHost,
+  normalizeAuthV2Endpoint,
+  normalizeV2MfaSecret,
+  normalizeV2ProxyUrl,
+} from './codex-auth-v2-client.mjs'
+import { cancelCodexV2AuthSession, consumeCodexV2Callback, createCodexV2AuthSession } from './codex-oauth.mjs'
 import { openaiIdentityFromOauthTokens } from './openai-jwt.mjs'
 
+export { WORKSPACE_POLICIES, isPrivateHost, normalizeV2MfaSecret, normalizeV2ProxyUrl }
+
 export const CODEX_LOGIN_SERVICE_KEY = 'codex_login_service'
+export const CODEX_AUTH_TOKEN_ENV = 'VM2API_CODEX_AUTH_TOKEN'
 export const SECRET_KEEP = '__KEEP__'
 
-const MAX_HEADERS = 20
-const MAX_HEADER_VALUE = 512
-const MAX_RESPONSE_BYTES = 8 * 1024 * 1024
-const IDLE_TIMEOUT_MS = 60_000
-const HEADER_NAME = /^[A-Za-z0-9!#$%&'*+.^_`|~-]{1,64}$/
-const RESERVED_HEADERS = new Set([
-  'host',
-  'content-length',
-  'content-type',
-  'transfer-encoding',
-  'connection',
-  'accept-encoding',
-])
-const TERMINAL_STATUS = new Set(['active', 'ok', 'success', 'succeeded', 'failed', 'error', 'auth_failed'])
-const SUCCESS_STATUS = new Set(['active', 'ok', 'success', 'succeeded'])
-const CREDENTIAL_FIELDS = [
-  'access_token',
-  'refresh_token',
-  'id_token',
-  'account_id',
-  'chatgpt_account_id',
-  'chatgpt_user_id',
-  'user_id',
-  'client_id',
-  'plan_type',
-]
+const MAX_SERVICE_TOKEN_LEN = 512
+const WORKSPACE_POLICY_SET = new Set(WORKSPACE_POLICIES)
+const WORKSPACE_KIND_SET = new Set(WORKSPACE_KINDS)
+const SELECTION_REASON_SET = new Set(SELECTION_REASONS)
 
 export const DEFAULT_GUARD_RULES = Object.freeze({
   probe_interval_min: 30,
@@ -73,79 +68,83 @@ export function normalizeGuardRules(raw = {}) {
   }
 }
 
-function headerNameOk(name) {
-  return HEADER_NAME.test(name) && !RESERVED_HEADERS.has(name.toLowerCase())
+export function normalizeWorkspacePolicy(raw, fallback = 'auto') {
+  const text = String(raw ?? '').trim()
+  return WORKSPACE_POLICY_SET.has(text) ? text : fallback
 }
 
-/** Stored shape. Header values stay as stored (encrypted when a DB secret is set). */
+export function validateEndpoint(raw) {
+  const checked = normalizeAuthV2Endpoint(raw)
+  return checked.ok ? { ok: true, value: checked.value } : { ok: false, error: checked.error }
+}
+
+export function envServiceToken() {
+  return String(process.env[CODEX_AUTH_TOKEN_ENV] || '').trim()
+}
+
+function tokenReadable(value) {
+  if (!value) return true
+  try {
+    maybeDecrypt(value)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** Stored Callback v2 service shape. Unknown legacy keys (headers, timeout_min) are safely dropped. */
 export function normalizeServiceConfig(raw = {}) {
   const src = raw && typeof raw === 'object' ? raw : {}
-  const headers = []
-  for (const row of Array.isArray(src.headers) ? src.headers : []) {
-    const name = String(row?.name || '').trim()
-    const value = row?.value == null ? '' : String(row.value)
-    if (!headerNameOk(name) || !value) continue
-    if (headers.some((h) => h.name.toLowerCase() === name.toLowerCase())) continue
-    headers.push({ name, value })
-    if (headers.length >= MAX_HEADERS) break
-  }
+  const checkedEndpoint = normalizeAuthV2Endpoint(src.endpoint || '')
+  const endpoint = checkedEndpoint.ok ? checkedEndpoint.value : String(src.endpoint || '').trim()
   return {
-    endpoint: String(src.endpoint || '').trim(),
-    headers,
-    timeout_min: clampInt(src.timeout_min, 1, 60, 25),
-    batch_concurrency: clampInt(src.batch_concurrency, 1, 8, 2),
+    endpoint,
+    service_token: typeof src.service_token === 'string' && src.service_token ? src.service_token : null,
+    workspace_policy: normalizeWorkspacePolicy(src.workspace_policy, 'auto'),
+    max_concurrency: clampInt(src.max_concurrency ?? src.batch_concurrency, 1, 512, 4),
     guard_enabled: src.guard_enabled !== false,
     guard: normalizeGuardRules(src.guard),
   }
 }
 
-/** Loopback, RFC 1918 / ULA / link-local, and single-label or internal names (Docker services). */
-export function isPrivateHost(hostname) {
-  const host = String(hostname || '')
-    .replace(/^\[|\]$/g, '')
-    .toLowerCase()
-  if (!host) return false
-  const version = net.isIP(host)
-  if (version === 4) {
-    const [a, b] = host.split('.').map(Number)
-    return (
-      a === 10 || a === 127 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 169 && b === 254)
-    )
-  }
-  if (version === 6) return host === '::1' || /^f[cd]/.test(host) || /^fe[89ab]/.test(host)
-  if (host === 'localhost' || !host.includes('.')) return true
-  return /\.(localhost|internal|local|lan|home\.arpa)$/.test(host)
-}
-
-/** Empty clears the setting. HTTPS everywhere; plain HTTP only to private hosts. No URL credentials. */
-export function validateEndpoint(raw) {
-  const text = String(raw ?? '').trim()
-  if (!text) return { ok: true, value: '' }
-  let url
-  try {
-    url = new URL(text)
-  } catch {
-    return { ok: false, error: 'invalid_endpoint' }
-  }
-  if (url.username || url.password) return { ok: false, error: 'invalid_endpoint' }
-  if (url.protocol === 'https:') return { ok: true, value: text }
-  if (url.protocol === 'http:') {
-    return isPrivateHost(url.hostname) ? { ok: true, value: text } : { ok: false, error: 'endpoint_requires_https' }
-  }
-  return { ok: false, error: 'invalid_endpoint' }
-}
-
-export function publicServiceConfig(raw = {}) {
+export function resolveServiceToken(raw = {}) {
   const cfg = normalizeServiceConfig(raw)
+  if (cfg.service_token) {
+    try {
+      const value = maybeDecrypt(cfg.service_token).trim()
+      if (!value) return { ok: false, error: 'login_service_unconfigured' }
+      return { ok: true, token: value, source: 'config' }
+    } catch {
+      return { ok: false, error: 'login_service_token_unreadable' }
+    }
+  }
+  const fromEnv = envServiceToken()
+  if (fromEnv) return { ok: true, token: fromEnv, source: 'env' }
+  return { ok: false, error: 'login_service_unconfigured' }
+}
+
+export function isServiceConfigured(raw = {}) {
+  const cfg = normalizeServiceConfig(raw)
+  if (!cfg.endpoint) return false
+  return !!cfg.service_token || !!envServiceToken()
+}
+
+export function publicServiceConfig(raw = {}, extra = {}) {
+  const cfg = normalizeServiceConfig(raw)
+  const envSet = !!envServiceToken()
+  const unreadable = !!cfg.service_token && !tokenReadable(cfg.service_token)
   return {
     endpoint: cfg.endpoint,
-    configured: !!cfg.endpoint,
-    headers: cfg.headers.map((h) => ({ name: h.name, value: '', value_set: true })),
-    timeout_min: cfg.timeout_min,
-    batch_concurrency: cfg.batch_concurrency,
+    configured: isServiceConfigured(cfg),
+    service_token_set: !!cfg.service_token || envSet,
+    service_token_source: cfg.service_token ? 'config' : envSet ? 'env' : null,
+    service_token_unreadable: unreadable,
+    workspace_policy: cfg.workspace_policy,
+    max_concurrency: cfg.max_concurrency,
     guard_enabled: cfg.guard_enabled,
     guard: cfg.guard,
     encryption_enabled: encryptionEnabled(),
+    ...extra,
   }
 }
 
@@ -162,7 +161,7 @@ function isKeep(value) {
   return !s || s === SECRET_KEEP || /^•+$/.test(s)
 }
 
-/** Merge a panel patch. A blank header value keeps the saved value of the same header. */
+/** Merge a panel settings patch. Blank `service_token` keeps the saved token; `service_token_clear` removes it. */
 export function applyServicePatch(settings, body = {}) {
   const src = body && typeof body === 'object' && !Array.isArray(body) ? body : {}
   const prev = readServiceConfig(settings)
@@ -172,29 +171,23 @@ export function applyServicePatch(settings, body = {}) {
     if (!checked.ok) return { ok: false, error: checked.error }
     next.endpoint = checked.value
   }
-  if (Object.hasOwn(src, 'headers')) {
-    if (!Array.isArray(src.headers) || src.headers.length > MAX_HEADERS) return { ok: false, error: 'invalid_headers' }
-    const headers = []
-    for (const row of src.headers) {
-      const name = String(row?.name || '').trim()
-      if (!headerNameOk(name)) return { ok: false, error: 'invalid_header_name' }
-      if (headers.some((h) => h.name.toLowerCase() === name.toLowerCase())) {
-        return { ok: false, error: 'duplicate_header' }
-      }
-      if (isKeep(row?.value)) {
-        const kept = prev.headers.find((h) => h.name.toLowerCase() === name.toLowerCase())
-        if (!kept) return { ok: false, error: 'header_value_required' }
-        headers.push({ name, value: kept.value })
-        continue
-      }
-      const value = String(row.value)
-      if (value.length > MAX_HEADER_VALUE || /[\r\n\0]/.test(value)) return { ok: false, error: 'invalid_header_value' }
-      headers.push({ name, value: maybeEncrypt(value) })
-    }
-    next.headers = headers
+  if (src.service_token_clear === true) {
+    next.service_token = null
   }
-  for (const key of ['timeout_min', 'batch_concurrency']) {
-    if (Object.hasOwn(src, key)) next[key] = src[key]
+  if (Object.hasOwn(src, 'service_token') && !isKeep(src.service_token)) {
+    const value = String(src.service_token).trim()
+    if (value.length > MAX_SERVICE_TOKEN_LEN || /[\r\n\0]/.test(value)) {
+      return { ok: false, error: 'invalid_service_token' }
+    }
+    next.service_token = maybeEncrypt(value)
+  }
+  if (Object.hasOwn(src, 'workspace_policy')) {
+    const policy = String(src.workspace_policy ?? '').trim()
+    if (!WORKSPACE_POLICY_SET.has(policy)) return { ok: false, error: 'invalid_workspace_policy' }
+    next.workspace_policy = policy
+  }
+  if (Object.hasOwn(src, 'max_concurrency')) {
+    next.max_concurrency = src.max_concurrency
   }
   if (Object.hasOwn(src, 'guard_enabled')) next.guard_enabled = src.guard_enabled !== false
   if (src.guard && typeof src.guard === 'object') next.guard = { ...prev.guard, ...src.guard }
@@ -203,286 +196,181 @@ export function applyServicePatch(settings, body = {}) {
   return { ok: true, config }
 }
 
+export async function checkServiceHealth(config, opts = {}) {
+  const cfg = normalizeServiceConfig(config)
+  return checkAuthV2ServiceHealth({ endpoint: cfg.endpoint, ...opts })
+}
+
 function fail(error, extra = {}) {
   return { ok: false, error, ...extra }
 }
 
-function resolveHeaders(config, randomId) {
-  const out = {}
-  for (const row of config.headers) {
-    let value
-    try {
-      value = maybeDecrypt(row.value)
-    } catch {
-      return null
-    }
-    if (value.includes('{{uuid}}')) value = value.replaceAll('{{uuid}}', randomId())
-    out[row.name.toLowerCase()] = value
-  }
-  return out
-}
-
-function requestHeaders(endpoint, extra) {
-  const origin = new URL(endpoint).origin
-  return {
-    'content-type': 'application/json',
-    accept: 'application/x-ndjson, application/json',
-    origin,
-    referer: `${origin}/`,
-    'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131.0',
-    ...extra,
-  }
-}
-
-/** Splits a byte stream into top-level JSON objects (NDJSON or one pretty-printed value). */
-function createJsonObjectStream(maxBytes) {
-  const decoder = new TextDecoder('utf-8')
-  let buf = ''
-  let pos = 0
-  let start = -1
-  let depth = 0
-  let inString = false
-  let escaped = false
-  let total = 0
-  return {
-    push(chunk) {
-      total += typeof chunk === 'string' ? Buffer.byteLength(chunk) : chunk.length
-      if (total > maxBytes) return { error: 'login_response_too_large', values: [] }
-      buf += typeof chunk === 'string' ? chunk : decoder.decode(chunk, { stream: true })
-      const values = []
-      for (; pos < buf.length; pos++) {
-        const ch = buf[pos]
-        if (start < 0) {
-          if (ch === '{') {
-            start = pos
-            depth = 1
-            inString = false
-            escaped = false
-          } else if (!/\s/.test(ch)) {
-            return { error: 'login_response_invalid', values }
-          }
-          continue
-        }
-        if (inString) {
-          if (escaped) escaped = false
-          else if (ch === '\\') escaped = true
-          else if (ch === '"') inString = false
-          continue
-        }
-        if (ch === '"') inString = true
-        else if (ch === '{' || ch === '[') depth++
-        else if (ch === '}' || ch === ']') {
-          depth--
-          if (depth === 0) {
-            try {
-              values.push(JSON.parse(buf.slice(start, pos + 1)))
-            } catch {
-              return { error: 'login_response_invalid', values }
-            }
-            start = -1
-          }
-        }
-      }
-      if (start < 0) {
-        buf = ''
-        pos = 0
-      } else if (start > 0) {
-        buf = buf.slice(start)
-        pos -= start
-        start = 0
-      }
-      return { values }
-    },
-  }
-}
-
-function toEpochMs(value) {
-  if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
-    return value < 1e12 ? Math.round(value * 1000) : Math.round(value)
-  }
-  if (typeof value === 'string' && value.trim()) {
-    const n = Number(value)
-    if (Number.isFinite(n) && n > 0) return toEpochMs(n)
-    const t = Date.parse(value)
-    if (Number.isFinite(t)) return t
-  }
-  return 0
-}
-
-function pickCredential(src) {
-  const out = {}
-  for (const key of CREDENTIAL_FIELDS) {
-    const value = src[key]
-    if (typeof value === 'string' && value.trim()) out[key] = value.trim()
-  }
-  const expiresAt = toEpochMs(src.expires_at ?? src.expired)
-  if (expiresAt) out.expires_at = expiresAt
-  return out
-}
-
-/** A provider code passes only when it is already a short identifier and carries no submitted secret. */
-function providerCode(raw, secrets) {
-  const code = String(raw ?? '').trim()
-  if (!/^[A-Za-z0-9_.-]{1,64}$/.test(code)) return 'relogin_rejected'
-  const lower = code.toLowerCase()
-  for (const secret of secrets) {
-    const s = String(secret || '').toLowerCase()
-    if (s.length >= 4 && lower.includes(s)) return 'relogin_rejected'
-  }
-  return lower
-}
-
-function decideEvent(event, secrets) {
-  if (!event || typeof event !== 'object' || Array.isArray(event)) return null
-  let payload
-  if (String(event.type || '').trim() === 'result') {
-    payload = event.payload
-    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return fail('login_response_invalid')
-  } else if (
-    Object.hasOwn(event, 'credential') ||
-    Object.hasOwn(event, 'error') ||
-    TERMINAL_STATUS.has(
-      String(event.status || '')
-        .trim()
-        .toLowerCase(),
-    )
-  ) {
-    payload = event
-  } else {
-    return null
-  }
-  const credential = payload.credential
-  if (credential && typeof credential === 'object' && !Array.isArray(credential)) {
-    const picked = pickCredential(credential)
-    if (!picked.access_token || !picked.refresh_token || !picked.id_token) return fail('login_credential_incomplete')
-    return { ok: true, credential: picked }
-  }
-  const err = payload.error
-  if (err != null && err !== false && err !== '') {
-    const code = err && typeof err === 'object' ? err.code : err
-    return fail('login_rejected', { detail: providerCode(code, secrets) })
-  }
-  const status = String(payload.status || '')
-    .trim()
-    .toLowerCase()
-  if (status && !SUCCESS_STATUS.has(status)) return fail('login_rejected', { detail: providerCode(status, secrets) })
-  return fail('login_no_credential')
-}
-
-function closeBody(body) {
-  try {
-    if (typeof body?.destroy === 'function') body.destroy()
-    else if (typeof body?.cancel === 'function') body.cancel().catch(() => {})
-  } catch {}
-}
-
-async function readOutcome(res, { armIdle, maxBytes, reason, secrets }) {
-  const parser = createJsonObjectStream(maxBytes)
-  const body = res.body
-  const consume = (chunk) => {
-    armIdle()
-    const step = parser.push(chunk)
-    for (const event of step.values) {
-      const decided = decideEvent(event, secrets)
-      if (decided) return decided
-    }
-    return step.error ? fail(step.error) : null
-  }
-  try {
-    if (body && typeof body[Symbol.asyncIterator] === 'function') {
-      for await (const chunk of body) {
-        const decided = consume(chunk)
-        if (decided) {
-          closeBody(body)
-          return decided
-        }
-      }
-    } else if (typeof res.text === 'function') {
-      const decided = consume(await res.text())
-      if (decided) return decided
-    }
-  } catch {
-    return fail(reason() || 'login_response_invalid')
-  }
-  return fail(reason() || 'login_no_result')
-}
-
 /**
- * One login through the configured service. Resolves to
- *   { ok: true, credential: { access_token, refresh_token, id_token, expires_at?, … } }
- *   { ok: false, error, status?, detail? }
+ * Full Callback v2 authentication flow for one account:
+ *   create strict OAuth session → POST /v2/authenticate → validate callback & exit →
+ *   single-use token exchange → OIDC/JWKS signature & identity verification.
+ *
+ * Caller MUST acquire its concurrency permit before invoking this function so the 10-minute
+ * OAuth session TTL is never consumed waiting in queue.
  */
 export async function loginWithService({
   config,
   email,
   password,
-  mfaSecret,
+  mfaSecret = null,
   proxyUrl = '',
+  vmId = null,
+  installationId = null,
+  expectedAccountId = null,
+  workspacePolicy = null,
+  resolveCurrentExit = null,
   signal = null,
+  onProgress = null,
   fetchImpl = nodeFetch,
+  exchangeFetchImpl = null,
+  exchangeImpl = undefined,
+  verifyImpl = undefined,
   randomId = () => crypto.randomUUID(),
-  idleTimeoutMs = IDLE_TIMEOUT_MS,
-  maxBytes = MAX_RESPONSE_BYTES,
+  idleTimeoutMs = DEFAULT_IDLE_TIMEOUT_MS,
+  now = () => Date.now(),
 } = {}) {
   const cfg = normalizeServiceConfig(config)
   if (!cfg.endpoint) return fail('login_service_unconfigured')
-  const checked = validateEndpoint(cfg.endpoint)
-  if (!checked.ok) return fail(checked.error)
-  const extra = resolveHeaders(cfg, randomId)
-  if (!extra) return fail('login_service_header_unreadable')
-  if (signal?.aborted) return fail('canceled')
-  const payload = { action: 'start', email, auth_mode: 'password_2fa', password, mfa_secret: mfaSecret }
-  if (proxyUrl) payload.proxy = proxyUrl
-  const secrets = [password, mfaSecret, proxyUrl]
+  const checkedEndpoint = normalizeAuthV2Endpoint(cfg.endpoint)
+  if (!checkedEndpoint.ok) return fail(checkedEndpoint.error)
 
-  const ac = new AbortController()
-  let why = null
-  const abort = (code) => {
-    if (why) return
-    why = code
-    ac.abort()
-  }
-  const onAbort = () => abort('canceled')
-  signal?.addEventListener?.('abort', onAbort, { once: true })
-  const total = setTimeout(() => abort('login_timeout'), cfg.timeout_min * 60_000)
-  let idle = null
-  const armIdle = () => {
-    clearTimeout(idle)
-    idle = setTimeout(() => abort('login_idle_timeout'), idleTimeoutMs)
-  }
+  const tokenRes = resolveServiceToken(cfg)
+  if (!tokenRes.ok) return fail(tokenRes.error)
+  if (signal?.aborted) return fail('canceled')
+
+  const mfaChecked = normalizeV2MfaSecret(mfaSecret)
+  if (!mfaChecked.ok) return fail(mfaChecked.error)
+
+  const proxyChecked = normalizeV2ProxyUrl(proxyUrl)
+  if (!proxyChecked.ok) return fail(proxyChecked.error)
+
+  const policy = workspacePolicy != null ? normalizeWorkspacePolicy(workspacePolicy, '') : cfg.workspace_policy
+  if (!policy) return fail('invalid_workspace_policy')
+
+  const taskId = String(randomId()).trim().toLowerCase()
+  let session
   try {
-    armIdle()
-    let res
-    try {
-      res = await fetchImpl(cfg.endpoint, {
-        method: 'POST',
-        headers: requestHeaders(cfg.endpoint, extra),
-        body: JSON.stringify(payload),
-        signal: ac.signal,
-        // Never replay a password to a redirect target.
-        redirect: 'manual',
+    session = createCodexV2AuthSession({
+      taskId,
+      vmId,
+      email,
+      installationId,
+      boundExit: proxyChecked.value,
+      expectedAccountId,
+      workspacePolicy: policy,
+      now: now(),
+    })
+  } catch (err) {
+    return fail(err?.code || 'invalid_request')
+  }
+
+  const onAbort = () => cancelCodexV2AuthSession(taskId)
+  signal?.addEventListener?.('abort', onAbort, { once: true })
+
+  try {
+    const authRes = await authenticateWithV2Service({
+      endpoint: checkedEndpoint.value,
+      serviceToken: tokenRes.token,
+      input: {
+        task_id: session.task_id,
+        email,
+        password,
+        mfa_secret: mfaChecked.value,
+        auth_url: session.auth_url,
+        proxy: session.bound_exit,
+        expires_at: session.expires_at,
+        workspace_policy: policy,
+        ...(expectedAccountId ? { expected_account_id: expectedAccountId } : {}),
+      },
+      signal,
+      onProgress,
+      idleTimeoutMs,
+      fetchImpl,
+      now,
+    })
+
+    if (!authRes.ok) {
+      cancelCodexV2AuthSession(taskId)
+      return fail(authRes.error, {
+        ...(authRes.status ? { status: authRes.status } : {}),
+        ...(authRes.stage ? { stage: authRes.stage } : {}),
+        ...(authRes.retryable ? { retryable: true } : {}),
+        ...(authRes.retryAfterMs ? { retryAfterMs: authRes.retryAfterMs } : {}),
       })
-    } catch {
-      return fail(why || 'login_service_unreachable')
     }
-    const status = Number(res?.status) || 0
-    if (status < 200 || status >= 300) {
-      closeBody(res?.body)
-      return fail('login_service_http', { status })
+
+    const consumed = await consumeCodexV2Callback({
+      taskId,
+      callbackUrl: authRes.callback_url,
+      selectedWorkspace: authRes.selected_workspace || null,
+      resolveCurrentExit,
+      fetchImpl: exchangeFetchImpl || undefined,
+      exchange: exchangeImpl,
+      verify: verifyImpl,
+      signal,
+      onProgress,
+      now,
+    })
+    if (!consumed.ok) {
+      return fail(consumed.error, {
+        ...(consumed.status ? { status: consumed.status } : {}),
+      })
     }
-    return await readOutcome(res, { armIdle, maxBytes, reason: () => why, secrets })
+
+    const selected = authRes.selected_workspace || null
+    const workspace = {
+      id: consumed.chatgpt_account_id,
+      kind: selected?.kind && WORKSPACE_KIND_SET.has(selected.kind) ? selected.kind : null,
+      name: typeof selected?.name === 'string' && selected.name.trim() ? selected.name.trim().slice(0, 200) : null,
+      selection_reason:
+        authRes.selection_reason && SELECTION_REASON_SET.has(authRes.selection_reason)
+          ? authRes.selection_reason
+          : null,
+      candidate_count: Number.isInteger(authRes.candidate_count) ? authRes.candidate_count : null,
+      selection_missing: !selected,
+    }
+
+    return {
+      ok: true,
+      verified: true,
+      credential: consumed.credential,
+      workspace,
+    }
   } finally {
-    clearTimeout(total)
-    clearTimeout(idle)
     signal?.removeEventListener?.('abort', onAbort)
+    cancelCodexV2AuthSession(taskId)
   }
 }
 
+function sanitizeWorkspaceAttachment(workspace) {
+  if (!workspace || typeof workspace !== 'object') return {}
+  const out = {}
+  if (WORKSPACE_KIND_SET.has(workspace.kind)) out.workspace_kind = workspace.kind
+  if (typeof workspace.name === 'string' && workspace.name.trim()) {
+    out.workspace_name = workspace.name.trim().slice(0, 200)
+  }
+  if (SELECTION_REASON_SET.has(workspace.selection_reason)) {
+    out.workspace_selection_reason = workspace.selection_reason
+  }
+  if (Number.isInteger(workspace.candidate_count) && workspace.candidate_count >= 1) {
+    out.workspace_candidate_count = workspace.candidate_count
+  }
+  if (workspace.selection_missing === true) {
+    out.workspace_selection_missing = true
+  }
+  return out
+}
+
 /**
- * Turn a login credential into a Codex account. Identity comes from the JWTs, never from
- * fields the service echoes, so a wrong account cannot pass the email check.
+ * Turn a verified Callback v2 credential into a Codex slot account with whitelisted workspace metadata.
+ * Identity comes from the JWTs, never from untrusted echoed fields.
  */
-export function codexAccountFromLogin(credential = {}) {
+export function codexAccountFromLogin(credential = {}, { workspace = null } = {}) {
   const identity = openaiIdentityFromOauthTokens({
     id_token: credential.id_token,
     access_token: credential.access_token,
@@ -493,6 +381,7 @@ export function codexAccountFromLogin(credential = {}) {
   const accountId = String(
     identity.chatgpt_account_id || credential.chatgpt_account_id || credential.account_id || '',
   ).trim()
+  const wsMeta = sanitizeWorkspaceAttachment(workspace)
   const parsed = parseCodexCredentialInput({
     access_token: credential.access_token,
     refresh_token: credential.refresh_token,
@@ -504,5 +393,12 @@ export function codexAccountFromLogin(credential = {}) {
   if (!parsed.ok || !parsed.account?.access_token || !parsed.account?.refresh_token) {
     return { ok: false, error: 'login_credential_incomplete' }
   }
-  return { ok: true, account: parsed.account, email, chatgpt_account_id: accountId || null }
+  const account = { ...parsed.account, ...wsMeta }
+  return {
+    ok: true,
+    account,
+    email,
+    chatgpt_account_id: accountId || null,
+    workspace: workspace ? { ...workspace, id: accountId || workspace.id || null } : null,
+  }
 }

@@ -157,6 +157,9 @@ function userVmPathAllowed(method, path) {
     if (rest === 'oauth/credential' || rest === 'package') return false
     return (
       rest === 'test-schedule' ||
+      rest === 'auto-reset' ||
+      rest === 'iq-check' ||
+      rest === 'iq-check/artifact' ||
       rest === 'probe' ||
       rest === 'count-tokens' ||
       rest === 'test-chat' ||
@@ -183,11 +186,15 @@ function userVmPathAllowed(method, path) {
       rest === 'openai-quota/refresh' ||
       rest === 'openai-quota/reset' ||
       rest === 'claude-reset/query' ||
-      rest === 'claude-reset/redeem'
+      rest === 'claude-reset/redeem' ||
+      rest === 'iq-check/run' ||
+      rest === 'iq-check/unisolate'
     )
   }
-  if (method === 'PUT') return rest === 'test-schedule'
-  if (method === 'DELETE') return rest === 'test-schedule'
+  if (method === 'PUT') return rest === 'test-schedule' || rest === 'auto-reset' || rest === 'iq-check'
+  if (method === 'DELETE') {
+    return rest === 'test-schedule' || rest === 'auto-reset' || rest === 'iq-check' || rest === 'iq-check/run'
+  }
   return false
 }
 

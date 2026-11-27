@@ -243,7 +243,8 @@ export function makeProxyFetch(proxyUrl, timeoutMs = 15000, { maxMs = 30000 } = 
     const agent = px ? createProxyAgent(px) : undefined
     const ac = new AbortController()
     const timer = setTimeout(() => ac.abort(), ms)
-    const opts = { ...init, signal: ac.signal }
+    const signal = init.signal ? AbortSignal.any([ac.signal, init.signal]) : ac.signal
+    const opts = { ...init, signal }
     if (agent) opts.agent = agent
     return fetch(url, opts).finally(() => clearTimeout(timer))
   }
@@ -339,6 +340,65 @@ export async function exchangeCodexAuthorizationCode(opts = {}) {
   } catch (e) {
     const aborted = e?.name === 'AbortError' || /aborted/i.test(String(e?.message || e))
     return { ok: false, error: aborted ? 'timeout' : 'fetch_failed' }
+  }
+}
+
+/**
+ * Strict Callback v2 authorization-code + PKCE exchange.
+ * Never follows redirects, enforces `access_token` + `refresh_token` + `id_token`, and
+ * distinguishes `exchange_outcome_unknown` (lost/unparseable response after dispatch)
+ * from `exchange_rejected` (upstream error) and `credential_incomplete`.
+ */
+export async function exchangeCodexAuthorizationCodeV2(opts = {}) {
+  const code = String(opts.code || '').trim()
+  const codeVerifier = String(opts.codeVerifier || '').trim()
+  if (!code || !codeVerifier) return { ok: false, error: 'code_required' }
+  if (opts.signal?.aborted) return { ok: false, error: 'canceled' }
+  const fetchFn = opts.fetchImpl || makeProxyFetch(opts.proxyUrl, opts.timeoutMs || 30_000, { maxMs: 60_000 })
+  const body = new URLSearchParams({
+    grant_type: 'authorization_code',
+    client_id: CODEX_OAUTH_CLIENT_ID,
+    redirect_uri: CODEX_OAUTH_REDIRECT_URI,
+    code,
+    code_verifier: codeVerifier,
+  })
+  let res
+  try {
+    res = await fetchFn(CODEX_OAUTH_TOKEN_URL, {
+      method: 'POST',
+      redirect: 'manual',
+      signal: opts.signal || undefined,
+      headers: {
+        accept: 'application/json',
+        'content-type': 'application/x-www-form-urlencoded',
+        'user-agent': CODEX_USER_AGENT,
+      },
+      body: body.toString(),
+    })
+  } catch {
+    return { ok: false, error: 'exchange_outcome_unknown' }
+  }
+  const status = Number(res?.status) || 0
+  const payload = await readFetchBody(res)
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    return { ok: false, error: 'exchange_outcome_unknown', status }
+  }
+  if (status < 200 || status >= 300 || payload.error) {
+    return { ok: false, error: 'exchange_rejected', status }
+  }
+  const access = typeof payload.access_token === 'string' ? payload.access_token.trim() : ''
+  const refresh = typeof payload.refresh_token === 'string' ? payload.refresh_token.trim() : ''
+  const idToken = typeof payload.id_token === 'string' ? payload.id_token.trim() : ''
+  if (!access || !refresh || !idToken) {
+    return { ok: false, error: 'credential_incomplete', status }
+  }
+  const expiresIn = Number(payload.expires_in)
+  return {
+    ok: true,
+    access_token: access,
+    refresh_token: refresh,
+    id_token: idToken,
+    expires_at: Number.isFinite(expiresIn) && expiresIn > 0 ? Date.now() + expiresIn * 1000 : 0,
   }
 }
 

@@ -102,7 +102,10 @@ export function CragGeminiPanel({
 
       <div className='space-y-2 rounded-xl border bg-card px-5 py-4 sm:px-6'>
         <div className='flex flex-wrap items-center justify-between gap-2'>
-          <Label htmlFor='craggemini-global-system-prompt' className='text-sm font-medium'>
+          <Label
+            htmlFor='craggemini-global-system-prompt'
+            className='text-sm font-medium'
+          >
             全局系统提示词（可选）
           </Label>
           <div className='flex items-center gap-2'>
@@ -157,19 +160,21 @@ export function CragGeminiPanel({
         </p>
         {active === 'official_full' ? (
           <p>
-            <strong>官方提示词模式</strong>：锁定 <code>agy</code> 原生渲染的完整官方提示词（含{' '}
-            <code>AGENTS.md</code> / <code>GEMINI.md</code> /{' '}
-            <code>user_global</code> 规则段）不改动；调用方请求的{' '}
-            <code>system</code> / <code>systemInstruction</code>{' '}
-            经安全清洗（剥离 Anthropic 计费归因头）后作为附加提示词追加到{' '}
-            <code>SystemPrompt</code> 末尾。调用方未传 system 时保持官方字节级原样。
+            <strong>官方提示词模式</strong>：锁定 <code>agy</code>{' '}
+            原生渲染的完整官方提示词（含 <code>AGENTS.md</code> /{' '}
+            <code>GEMINI.md</code> / <code>user_global</code>{' '}
+            规则段）不改动；调用方请求的 <code>system</code> /{' '}
+            <code>systemInstruction</code> 经安全清洗（剥离 Anthropic
+            计费归因头）后作为附加提示词追加到 <code>SystemPrompt</code>{' '}
+            末尾。调用方未传 system 时保持官方字节级原样。
           </p>
         ) : (
           <p>
             <strong>0提示词模式</strong>：根据调用方请求携带的{' '}
-            <code>system</code> / <code>systemInstruction</code>{' '}
-            直接替换原本的 <code>agy</code> 官方系统提示词；若调用方未携带 system
-            且未配置全局提示词，则发送空串 <code>&quot;&quot;</code>（0 提示词）。子代理独立会话仍保留其原有提示词。
+            <code>system</code> / <code>systemInstruction</code> 直接替换原本的{' '}
+            <code>agy</code> 官方系统提示词；若调用方未携带 system
+            且未配置全局提示词，则发送空串 <code>&quot;&quot;</code>（0
+            提示词）。子代理独立会话仍保留其原有提示词。
           </p>
         )}
         <ul className='list-disc space-y-1 pl-5'>

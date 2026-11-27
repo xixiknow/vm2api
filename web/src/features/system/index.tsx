@@ -154,7 +154,11 @@ export function SystemPromptPage() {
               [
                 ['cli-node', 'cli-node 原生内核', '模板注入，写入 kernel.json'],
                 ['crag', 'CRAG v2 print', '不读 persona_preset，不是 TUI'],
-                ['craggemini', 'CRAGGemini (Antigravity)', 'agy 官方 / 0 提示词'],
+                [
+                  'craggemini',
+                  'CRAGGemini (Antigravity)',
+                  'agy 官方 / 0 提示词',
+                ],
               ] as const
             ).map(([value, label, detail]) => {
               const selected = kernelSet === value

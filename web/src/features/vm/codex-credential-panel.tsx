@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { useMutation, useQueryClient } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import type { Vm } from '@/types/panel-vm'
 import { Copy, ExternalLink, Upload } from 'lucide-react'
 import { toast } from 'sonner'
@@ -9,14 +9,23 @@ import { proxyNamedLabel } from '@/lib/vm-status'
 import { Button } from '@/components/ui/button'
 import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
+import { meQueryOptions } from '@/features/auth/queries'
+import { CodexSlotPasswordLoginForm } from '@/features/codex-login/slot-password-login-form'
 import { dashboardQueryOptions } from '@/features/overview/queries'
 import type { CommitResult } from '@/features/vm/credential-panel'
 import { vmQueryOptions } from '@/features/vm/queries'
 
-type CodexImportMode = 'oauth' | 'access_token' | 'refresh_token' | 'json'
+type CodexImportMode =
+  'oauth' | 'password' | 'access_token' | 'refresh_token' | 'json'
 
-const MODES: { id: CodexImportMode; label: string }[] = [
+const BASE_MODES: { id: CodexImportMode; label: string }[] = [
   { id: 'oauth', label: 'OAuth' },
+  { id: 'json', label: '账号文件' },
+]
+
+const ADMIN_MODES: { id: CodexImportMode; label: string }[] = [
+  { id: 'oauth', label: 'OAuth' },
+  { id: 'password', label: '密码登录' },
   { id: 'json', label: '账号文件' },
 ]
 
@@ -36,10 +45,12 @@ const EMPTY_LINK: Link = {
 
 function Seg({
   value,
+  options,
   onChange,
   disabled,
 }: {
   value: CodexImportMode
+  options: { id: CodexImportMode; label: string }[]
   onChange: (next: CodexImportMode) => void
   disabled?: boolean
 }) {
@@ -49,7 +60,7 @@ function Seg({
       aria-label='账号添加方式'
       className='flex flex-wrap items-center gap-1.5'
     >
-      {MODES.map((option) => (
+      {options.map((option) => (
         <Button
           key={option.id}
           type='button'
@@ -97,6 +108,9 @@ export function CodexCredentialPanel({
   onCommitted?: (data: CommitResult, vmId: string, what: string) => void
 }) {
   const qc = useQueryClient()
+  const me = useQuery(meQueryOptions())
+  const isAdmin = me.data?.role === 'admin'
+  const modes = isAdmin ? ADMIN_MODES : BASE_MODES
   const fileRef = useRef<HTMLInputElement>(null)
   const [mode, setMode] = useState<CodexImportMode>('oauth')
   const [text, setText] = useState('')
@@ -219,11 +233,13 @@ export function CodexCredentialPanel({
   return (
     <div className='space-y-3'>
       <Hint>
-        对齐 Codex Desktop：OAuth 授权或账号文件（auth.json）。不要用 Claude
-        sessionKey、Setup Token 或 Console Key。一槽一号。
+        对齐 Codex Desktop：OAuth 授权、密码登录或账号文件（auth.json）。不要用
+        Claude sessionKey、Setup Token 或 Console Key。一槽一号。
       </Hint>
-      <Seg value={mode} onChange={setMode} disabled={busy} />
-      {mode === 'oauth' ? (
+      <Seg value={mode} options={modes} onChange={setMode} disabled={busy} />
+      {mode === 'password' && isAdmin ? (
+        <CodexSlotPasswordLoginForm vm={vm} onCommitted={onCommitted} />
+      ) : mode === 'oauth' ? (
         linkReady ? (
           <div className='space-y-2'>
             <div className='flex flex-wrap items-center gap-2'>

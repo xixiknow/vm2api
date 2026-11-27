@@ -523,7 +523,7 @@ async function commitImportedCodexVm({
   existing.platform = 'openai'
   existing.family = 'codex'
   existing.codex_kernel = true
-  existing.codex = {
+  const nextCodex = {
     ...(existing.codex && typeof existing.codex === 'object' ? existing.codex : {}),
     has_access: !!saved.access_token,
     has_refresh: !!saved.refresh_token,
@@ -531,6 +531,17 @@ async function commitImportedCodexVm({
     email: saved.email || null,
     expires_at: saved.expires_at || null,
   }
+  for (const key of [
+    'workspace_kind',
+    'workspace_name',
+    'workspace_selection_reason',
+    'workspace_candidate_count',
+    'workspace_selection_missing',
+  ]) {
+    if (saved[key] != null) nextCodex[key] = saved[key]
+    else delete nextCodex[key]
+  }
+  existing.codex = nextCodex
   const global = normalizeOpenAIQuotaPolicy(routingConfig.codex?.quota || {})
   const preservePin = (value, override) =>
     previousPolicy[override] === true &&
@@ -2326,6 +2337,9 @@ export function createPanelHandler(ctx) {
       if (p.startsWith('/api/panel/cluster/')) return ctx.clusterRoutes.handle(req, res, url)
       if (p.startsWith('/api/panel/codex-login/') && ctx.codexLoginRoutes)
         return ctx.codexLoginRoutes.handle(req, res, url)
+      if (p.startsWith('/api/panel/auto-reset/') && ctx.autoResetRoutes)
+        return ctx.autoResetRoutes.handleGlobal(req, res, url)
+      if (p.startsWith('/api/panel/gpt-iq/') && ctx.gptIqRoutes) return ctx.gptIqRoutes.handleGlobal(req, res, url)
       if (req.method === 'GET' && p === '/api/panel/database/metrics') {
         const snapshot = await snapshotDatabaseMetricsAsync({
           db: getDb(),
@@ -3382,6 +3396,7 @@ export function createPanelHandler(ctx) {
           role: ident.role,
           ownerUserId: ident.role === 'user' ? req.panelUserId : null,
           clusterNodes: clusterNodesOf(ctx),
+          gptIq: ctx.gptIq,
         })
         if (filterOwner && built?.data) {
           if (Array.isArray(built.data.items)) {
@@ -4297,6 +4312,7 @@ export function createPanelHandler(ctx) {
           kernelHealth: panelKernelHealth,
           clusterNodes: clusterNodesOf(ctx),
           role: ident.role,
+          gptIq: ctx.gptIq,
         })
         if (result.status) return json(res, result.status, result.body)
         return json(res, 200, result)
@@ -4798,6 +4814,9 @@ export function createPanelHandler(ctx) {
         const id = p.split('/')[4]
         const result = await panel.buildOpenaiQuotaRefresh({ cfg, id, routingConfig: ctx.routingConfig })
         if (result.status) return json(res, result.status, result.body)
+        try {
+          ctx.autoReset?.invalidateNoCardBackoff?.(id)
+        } catch {}
         return json(res, 200, result)
       }
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/openai-quota\/reset$/.test(p)) {
@@ -4805,6 +4824,19 @@ export function createPanelHandler(ctx) {
         const result = await panel.buildOpenaiQuotaReset({ cfg, id, routingConfig: ctx.routingConfig })
         if (result.status) return json(res, result.status, result.body)
         return json(res, 200, result)
+      }
+      if (
+        (req.method === 'GET' || req.method === 'PUT' || req.method === 'DELETE') &&
+        /^\/api\/panel\/vms\/[^/]+\/auto-reset$/.test(p) &&
+        ctx.autoResetRoutes
+      ) {
+        return ctx.autoResetRoutes.handleSlot(req, res, decodeURIComponent(p.split('/')[4]))
+      }
+      if (ctx.gptIqRoutes) {
+        const iqMatch = /^\/api\/panel\/vms\/([^/]+)\/iq-check(?:\/(run|unisolate|artifact))?$/.exec(p)
+        if (iqMatch) {
+          return ctx.gptIqRoutes.handleSlot(req, res, decodeURIComponent(iqMatch[1]), iqMatch[2] || '')
+        }
       }
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/claude-reset\/query$/.test(p)) {
         const id = p.split('/')[4]
@@ -5010,6 +5042,9 @@ export function createPanelHandler(ctx) {
         }
         const reason = body.schedulable ? null : body.reason || 'disabled'
         const summary = setScheduleOff(cfg.paths.project, id, !body.schedulable, { reason, preserveStatus: true })
+        try {
+          ctx.gptIq?.refreshSummaryCache?.(id)
+        } catch {}
         return json(
           res,
           200,
@@ -5135,6 +5170,12 @@ export function createPanelHandler(ctx) {
           } catch {}
           try {
             ctx.codexLogin?.onVmDeleted?.(id)
+          } catch {}
+          try {
+            ctx.autoReset?.onVmDeleted?.(id)
+          } catch {}
+          try {
+            ctx.gptIq?.onVmDeleted?.(id)
           } catch {}
           try {
             const chat = path.join(cfg.paths.project, 'vms', `${id}-chat.json`)

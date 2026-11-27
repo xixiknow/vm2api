@@ -1,12 +1,22 @@
 import type { StatusTone } from '@/types/status'
+import { codexAuthStageText } from './batch-text'
 import type { CodexLoginProfile } from './types'
 
 /** 一个登记槽位当前最需要知道的一件事。 */
 export function profileTone(profile: CodexLoginProfile): StatusTone {
   const tone = (key: string, text: string, cls: string) => ({ key, text, cls })
-  if (profile.relogin.state !== 'idle') return tone('relogin', '重登中', 'warn')
+  if (profile.relogin.state === 'queued') {
+    return tone('relogin_queued', '排队重登', 'warn')
+  }
+  if (profile.relogin.state !== 'idle') {
+    const stage = codexAuthStageText(profile.relogin.stage)
+    return tone('relogin', stage ? `重登中 · ${stage}` : '重登中', 'warn')
+  }
   if (profile.secret_unreadable)
     return tone('unreadable', '密码无法解密', 'bad')
+  if (profile.state.auto_paused === 'workspace_not_found') {
+    return tone('workspace_paused', '原工作区失效', 'bad')
+  }
   if (profile.state.auto_paused) return tone('paused', '自动重登已暂停', 'bad')
   if (profile.state.last_relogin_result === 'failed') {
     return tone('relogin_failed', '上次重登失败', 'bad')

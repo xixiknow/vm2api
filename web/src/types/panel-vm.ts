@@ -82,12 +82,12 @@ export type VmCodexCredits = {
 
 export type CragLicenseStatus = {
   status:
-  | 'unlicensed'
-  | 'valid'
-  | 'expired'
-  | 'not_yet_valid'
-  | 'invalid'
-  | 'unconfigured'
+    | 'unlicensed'
+    | 'valid'
+    | 'expired'
+    | 'not_yet_valid'
+    | 'invalid'
+    | 'unconfigured'
   valid: boolean
   vm_id: string
   /** offline: CRAGU1 universal code. online: device-bound CRAGL1. */
@@ -114,13 +114,13 @@ export type CragLicenseResponse = {
 export type VmTelemetryState = {
   enabled: boolean
   state:
-  | 'disabled'
-  | 'idle'
-  | 'waiting_credentials'
-  | 'waiting_egress'
-  | 'uploading'
-  | 'error'
-  | 'unsupported'
+    | 'disabled'
+    | 'idle'
+    | 'waiting_credentials'
+    | 'waiting_egress'
+    | 'uploading'
+    | 'error'
+    | 'unsupported'
   pending_events: number
   last_upload_at: string | null
   last_error: string | null
@@ -396,11 +396,11 @@ export type Vm = {
   /** Mutable stored quota state: official windows may be reconciled from headers. */
   quota_observations?: {
     official:
-    | ({ updated_at: string | null } & Record<
-      '5h' | '7d',
-      QuotaObservation | null
-    >)
-    | null
+      | ({ updated_at: string | null } & Record<
+          '5h' | '7d',
+          QuotaObservation | null
+        >)
+      | null
     passive: Record<'5h' | '7d', QuotaObservation | null>
   } | null
   utilization_5h?: number | null
@@ -538,14 +538,14 @@ export type Vm = {
   quota_inherited?: VmQuotaView | null
   /** OpenAI 的生效额度与限制原因；不包含 Claude 分档/weekly split。 */
   openai_quota_policy?:
-  | (OpenAIQuotaPolicy & {
-    reason: string | null
-    restricted_until: number | null
-    concurrency_override: boolean
-    rpm_override: boolean
-    sessions_override: boolean
-  })
-  | null
+    | (OpenAIQuotaPolicy & {
+        reason: string | null
+        restricted_until: number | null
+        concurrency_override: boolean
+        rpm_override: boolean
+        sessions_override: boolean
+      })
+    | null
   /** 当前有效调度等级；自动模式范围 1～7，手动模式范围 1～10。 */
   schedule_level?: number
   /** 调度等级来源；缺失时按自动模式展示。 */
@@ -584,6 +584,14 @@ export type Vm = {
   oauth_registration?: 'console' | 'oauth' | null
   account_uuid?: string
   org_uuid?: string
+  codex_workspace?: {
+    id: string | null
+    kind: 'personal' | 'organization' | 'unknown' | null
+    name: string | null
+    selection_reason: string | null
+    candidate_count: number | null
+    selection_missing: boolean
+  } | null
   access_preview?: string
   refresh_preview?: string
   last_probe?: {
@@ -648,6 +656,37 @@ export type Vm = {
   window_7d_tokens?: number
   /** 近 24h 每 30 分钟 [成功, 失败]，最后一格是当前；无请求为 null。 */
   health_24h?: Array<[number, number]> | null
+  /** GPT（Codex）槽位测智摘要（由 manxue.ai 桥接检测写入）。 */
+  iq_check?: {
+    enabled: boolean
+    mode: 'inherit' | 'enabled' | 'disabled'
+    running: boolean
+    isolated: boolean
+    isolated_at: string | null
+    status: 'normal' | 'degraded' | 'unknown' | 'error' | null
+    raw_status: string | null
+    reference_only: boolean
+    label: string | null
+    reason: string | null
+    benchmark: 'pelican' | 'candy' | 'creative'
+    model: string
+    reasoning_effort: string
+    interval_min: number
+    last_checked_at: string | null
+    next_run_at: string | null
+    last_duration_ms: number | null
+    last_error: string | null
+    has_artifact: boolean
+    stale_24h: boolean
+    consecutive_degraded: number
+    summary_24h: {
+      total: number
+      normal: number
+      degraded: number
+      unknown: number
+      error: number
+    }
+  } | null
   window_fable_cost?: number
   estimate_5h?: WindowEstimate
   estimate_7d?: WindowEstimate
@@ -788,16 +827,16 @@ export type VmDetailPayload = {
   proxy?: VmProxySnap | null
   account?: Record<string, unknown> | null
   billing?:
-  | (Record<string, unknown> & {
-    by_model?: VmBillingModelRow[]
-    usage_stats?: VmUsageStats | null
-    window_5h?: VmBillingPeriod | null
-    window_7d?: VmBillingPeriod | null
-    prev_window_5h?: VmClosedWindow | null
-    prev_window_7d?: VmClosedWindow | null
-    window_5h_projection?: VmWindowProjection | null
-  })
-  | null
+    | (Record<string, unknown> & {
+        by_model?: VmBillingModelRow[]
+        usage_stats?: VmUsageStats | null
+        window_5h?: VmBillingPeriod | null
+        window_7d?: VmBillingPeriod | null
+        prev_window_5h?: VmClosedWindow | null
+        prev_window_7d?: VmClosedWindow | null
+        window_5h_projection?: VmWindowProjection | null
+      })
+    | null
   [key: string]: unknown
 }
 

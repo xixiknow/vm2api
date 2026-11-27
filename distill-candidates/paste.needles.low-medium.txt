@@ -1,0 +1,26 @@
+You will be given a competitive programming problem.
+Your solution must read input from standard input (
+Put your final solution within a single code block:
+Analyze the maximum input constraints and identify the optimal algorithmic approach
+Return your final response as 'Final Answer: \boxed{<answer>}'
+Provide a good and informational response to it like a helpful human would.
+Your job is to predict the output of 'stuff' given the provided input.
+Return your response as a json with a field 'output' that contains the predicted output string.
+Now provide the response and nothing else.
+analisying questions, summarizing relevant findings
+only their names are known until you load their schemas with ToolSearch
+End with a brief summary: the root cause, what you changed, and proof that it passes.
+You are an autonomous coding agent running on the user's machine.
+authoring seeds for the fable-code training-data pipeline
+seed authoring preamble
+reasoning style of a distilled Claude Mythos model
+Act as a Mythos research collaborator:
+You are WithinUsAI Master Scholars
+The source below is already a question, task, or problem.
+The last line of your response should be of the following format: 'Answer: $LETTER'
+You will be given a question (problem specification) and will generate a correct Python program that matches the specification and passes all tests.
+(do not directly test on the sample inputs)
+self-contained Python script that solves the following problem in a markdown code block
+The following are multiple choice questions (with answers) about
+What is the correct answer to this question:
+These task instructions will be given to a GPT model

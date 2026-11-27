@@ -7,7 +7,7 @@
  * counts as an auth failure. After `fail_threshold` failures in a row the slot leaves the pool
  * (`oauth_invalid_grant`) and an automatic re-login is queued.
  */
-import { normalizeGuardRules } from './codex-login-service.mjs'
+import { isServiceConfigured, normalizeGuardRules } from './codex-login-service.mjs'
 
 let activeGuard = null
 
@@ -95,6 +95,7 @@ export function createCodexLoginGuard({
   isCodexVm,
   probe,
   markDead,
+  isSlotBusy = () => false,
   tickMs = 60_000,
   maxPerTick = 5,
   concurrency = 2,
@@ -144,7 +145,7 @@ export function createCodexLoginGuard({
     ticking = true
     try {
       const cfg = readConfig() || {}
-      if (!cfg.guard_enabled || !cfg.endpoint) return { probed: 0, results: [] }
+      if (!cfg.guard_enabled || !isServiceConfigured(cfg)) return { probed: 0, results: [] }
       const rules = normalizeGuardRules(cfg.guard)
       const t = now()
       const due = profiles
@@ -153,7 +154,7 @@ export function createCodexLoginGuard({
         .filter((p) => nudged.has(p.vm_id) || (p.state.next_probe_at || 0) <= t)
         .filter((p) => {
           const vm = getVm(p.vm_id)
-          return vm && isCodexVm(vm) && relogin.status(p.vm_id).state === 'idle'
+          return vm && isCodexVm(vm) && relogin.status(p.vm_id).state === 'idle' && !isSlotBusy(p.vm_id)
         })
         .sort(
           (a, b) =>

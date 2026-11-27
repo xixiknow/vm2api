@@ -111,7 +111,7 @@ export function ClaudeLogin({
                 {committed ? '完成收起' : '收起（放弃本次授权）'}
               </Button>
             </div>
-            <p className='text-xs text-muted-foreground wrap-anywhere'>
+            <p className='text-xs wrap-anywhere text-muted-foreground'>
               {vm.name || vm.id}：打开链接完成授权，然后将授权码粘贴回来。
             </p>
             {committed ? (
@@ -159,7 +159,8 @@ export function ClaudeLogin({
                 ) : null}
               </div>
               <p className='text-xs text-muted-foreground'>
-                在使用本槽绑定出口的浏览器中打开链接（「桌面」tab 的浏览器即走本槽出口）。
+                在使用本槽绑定出口的浏览器中打开链接（「桌面」tab
+                的浏览器即走本槽出口）。
               </p>
             </div>
             <form

@@ -35,6 +35,7 @@ const UNSCHEDULABLE_REASONS = Object.freeze({
   vm_dead: '进程已退出',
   vm_error: '槽位错误',
   vm_disabled: '已禁用',
+  gpt_iq_degraded: '测智降智隔离',
 })
 
 /** System holds: written and cleared by the system itself (受限 · slot). */
@@ -161,6 +162,8 @@ export const CLEAR_BY = Object.freeze([
   // leftover from a start attempt that timed out on a flaky node link — the
   // container never died. Health is a fact, not a verdict, same as above.
   'runtime_recovered',
+  // Lifting a gpt_iq_degraded isolation explicitly (manual unisolate or verified recovery).
+  'iq_recovered',
 ])
 
 // ---------------------------------------------------------------------------

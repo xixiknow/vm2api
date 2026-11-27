@@ -188,6 +188,11 @@ import { createIntegrationHandler } from './lib/admin/integration-routes.mjs'
 import { createCragShopHandler, isCragShopPath, sessionBuyerOwner } from './lib/admin/crag-shop.mjs'
 import { createCodexLoginRoutes } from './lib/admin/codex-login-routes.mjs'
 import { createCodexLoginRuntime } from './lib/oauth/codex-login-runtime.mjs'
+import { createAutoResetRoutes } from './lib/admin/auto-reset-routes.mjs'
+import { createAutoResetRuntime } from './lib/oauth/auto-reset-runtime.mjs'
+import { createManxueBridge, createManxueBridgeHandler } from './lib/iq/manxue-bridge.mjs'
+import { createGptIqRuntime } from './lib/iq/gpt-iq-runtime.mjs'
+import { createGptIqRoutes } from './lib/admin/gpt-iq-routes.mjs'
 
 const FEATURES = [
   'passthrough',
@@ -1374,6 +1379,28 @@ const codexLogin = createCodexLoginRuntime({
 })
 const codexLoginRoutes = createCodexLoginRoutes({ runtime: codexLogin, json, readBody, ok: panel.ok })
 
+// GPT auto reset voucher (fork): global + per-slot personalized automatic reset credit redemption.
+const autoReset = createAutoResetRuntime({
+  projectRoot: cfg.paths.project,
+  getRouting: () => routingConfig,
+})
+const autoResetRoutes = createAutoResetRoutes({ runtime: autoReset, json, readBody, ok: panel.ok })
+
+// GPT IQ / degradation check (fork): manxue.ai bridge + scheduled isolation runtime.
+const manxueBridge = createManxueBridge()
+const handleManxueBridge = createManxueBridgeHandler({
+  bridge: manxueBridge,
+  getLoopbackBaseUrl: () => `http://127.0.0.1:${cfg.port}`,
+  getMasterApiKey: () => cfg.api_key,
+  json,
+})
+const gptIq = createGptIqRuntime({
+  projectRoot: cfg.paths.project,
+  bridge: manxueBridge,
+  getPublicBaseUrl: () => process.env.PUBLIC_BASE_URL || cfg.base_url || '',
+})
+const gptIqRoutes = createGptIqRoutes({ runtime: gptIq, json, readBody, ok: panel.ok })
+
 const listCragTargets = () =>
   listVms(cfg.paths.project)
     .map(({ id }) => getVm(cfg.paths.project, id))
@@ -1547,6 +1574,10 @@ const handlePanel = createPanelHandler({
   slotShell,
   codexLogin,
   codexLoginRoutes,
+  autoReset,
+  autoResetRoutes,
+  gptIq,
+  gptIqRoutes,
   slotDesktop,
   geminiTerminal,
 })
@@ -1774,6 +1805,11 @@ const server = http.createServer(async (req, res) => {
           status: 503,
         }).body,
       )
+    }
+
+    if (p.startsWith('/api/manxue-bridge/')) {
+      const handled = await handleManxueBridge(req, res, p)
+      if (handled !== false) return
     }
 
     if (p.startsWith('/api/integration')) {
@@ -2403,6 +2439,23 @@ server.listen(cfg.port, cfg.host, () => {
       onLeaderStop(() => codexLogin.stop())
     } catch (e) {
       console.warn('[codex-login] start failed', e?.message || e)
+    }
+    try {
+      // GPT auto reset voucher (fork): only the leader runs automatic reset redemption.
+      autoReset.start()
+      onLeaderStop(() => autoReset.stop())
+    } catch (e) {
+      console.warn('[auto-reset] start failed', e?.message || e)
+    }
+    try {
+      // GPT IQ / degradation check (fork): only the leader schedules manxue.ai checks.
+      gptIq.start()
+      onLeaderStop(() => {
+        gptIq.stop()
+        manxueBridge.stop()
+      })
+    } catch (e) {
+      console.warn('[gpt-iq] start failed', e?.message || e)
     }
     try {
       // Size slots before the watchdog compares kernel slot counts: otherwise a slot

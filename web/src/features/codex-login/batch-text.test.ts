@@ -6,6 +6,7 @@ import {
   checkBatchText,
   codexLoginCodeText,
   codexLoginErrorText,
+  codexWorkspaceSummary,
   hasRetryableRows,
   rowTone,
 } from './batch-text'
@@ -13,24 +14,30 @@ import { profileTone } from './profile-tone'
 import type { CodexLoginBatch, CodexLoginProfile } from './types'
 
 describe('checkBatchText', () => {
-  it('accepts both separators, skips blanks and comments', () => {
+  it('accepts 3-column TOTP and 2-column / blank no-MFA lines, skips blanks and comments', () => {
     expect(
-      checkBatchText('# list\nA@x.com----p1----ABCD EFGH\n\nb@x.com,p2,T2\n')
-    ).toEqual({ ok: true, count: 2 })
+      checkBatchText(
+        '# list\nA@x.com----p1----JBSW Y3DP EHPK 3PXP\n\nb@x.com,p2\nc@x.com----p3----\nd@x.com,p4,otpauth://totp/x?secret=JBSWY3DPEHPK3PXP\n'
+      )
+    ).toEqual({ ok: true, count: 4 })
   })
 
-  it('reports the line, never its content', () => {
-    const bad = checkBatchText('a@x.com----SECRET----t\nbroken SECRET')
+  it('reports only the line number, never its content', () => {
+    const bad = checkBatchText('a@x.com----SECRET\nbroken SECRET')
     expect(bad).toEqual({ ok: false, line: 2, reason: 'format' })
     expect(batchTextProblem(bad)).toBe(
-      '第 2 行格式不对：需要 邮箱----密码----2FA密钥'
+      '第 2 行格式不对：需要 邮箱----密码 或 邮箱----密码----2FA密钥'
     )
     expect(batchTextProblem(bad)).not.toContain('SECRET')
   })
 
-  it('rejects missing fields, duplicates, empty and oversized batches', () => {
-    expect(checkBatchText('a@x.com----pw----').ok).toBe(false)
-    expect(checkBatchText('a@x.com,p,t\nA@x.com,p,t')).toEqual({
+  it('rejects invalid TOTP, duplicates, empty and oversized batches', () => {
+    expect(checkBatchText('a@x.com----pw----bad-totp')).toEqual({
+      ok: false,
+      line: 1,
+      reason: 'invalid_totp',
+    })
+    expect(checkBatchText('a@x.com,p\nA@x.com,p')).toEqual({
       ok: false,
       line: 2,
       reason: 'duplicate',
@@ -40,7 +47,7 @@ describe('checkBatchText', () => {
       line: 0,
       reason: 'empty',
     })
-    const many = Array.from({ length: 101 }, (_, i) => `u${i}@x.com,p,t`).join(
+    const many = Array.from({ length: 101 }, (_, i) => `u${i}@x.com,p`).join(
       '\n'
     )
     expect(batchTextProblem(checkBatchText(many))).toBe('一次最多 100 个账号')
@@ -48,21 +55,48 @@ describe('checkBatchText', () => {
 })
 
 describe('labels', () => {
-  it('maps row status to a tone', () => {
+  it('maps row status and live Callback v2 stages to tones', () => {
     expect(rowTone('created')).toMatchObject({ text: '已导入', cls: 'ok' })
     expect(rowTone('import_failed')).toMatchObject({ cls: 'bad' })
-    expect(rowTone('logging_in')).toMatchObject({ cls: 'warn' })
+    expect(rowTone('logging_in')).toMatchObject({ text: '登录中', cls: 'warn' })
+    expect(rowTone('logging_in', 'verifying_mfa')).toMatchObject({
+      text: '验证 2FA',
+      cls: 'warn',
+    })
   })
 
-  it('explains codes with their detail', () => {
-    expect(codexLoginCodeText('login_rejected', 'invalid_password')).toBe(
-      '登录被拒（invalid_password）'
+  it('explains Callback v2 error codes and workspace summaries', () => {
+    expect(codexLoginCodeText('password_rejected')).toBe('账号或密码错误')
+    expect(codexLoginCodeText('workspace_not_found')).toBe(
+      '原工作区已失效或不在候选列表'
     )
-    expect(codexLoginCodeText('login_service_http', 'http_502')).toBe(
-      '登录服务返回错误（HTTP 502）'
+    expect(codexLoginCodeText('no_free_proxy')).toBe(
+      '代理池没有空闲出口，请先添加或启用代理'
     )
     expect(codexLoginCodeText(null, 'email_exists')).toBe('邮箱已在其他槽位')
     expect(codexLoginCodeText(null, null)).toBe('')
+
+    expect(
+      codexWorkspaceSummary({
+        id: 'ws_1',
+        kind: 'organization',
+        name: 'Team A',
+        selection_reason: 'organization_preferred',
+        candidate_count: 2,
+        selection_missing: false,
+      })
+    ).toBe('组织 · Team A · 优先组织 · 2 候选')
+
+    expect(
+      codexWorkspaceSummary({
+        id: 'ws_2',
+        kind: null,
+        name: null,
+        selection_reason: null,
+        candidate_count: null,
+        selection_missing: true,
+      })
+    ).toBe('未返回选择元数据')
   })
 
   it('keeps the server line message for batch errors', () => {
@@ -118,10 +152,22 @@ describe('profileTone', () => {
     },
   }
 
-  it('puts running and broken states first', () => {
-    expect(profileTone({ ...base, relogin: { state: 'running' } }).text).toBe(
-      '重登中'
+  it('shows live relogin stage, queued state, and workspace_not_found pause', () => {
+    expect(profileTone({ ...base, relogin: { state: 'queued' } }).text).toBe(
+      '排队重登'
     )
+    expect(
+      profileTone({
+        ...base,
+        relogin: { state: 'running', stage: 'selecting_workspace' },
+      }).text
+    ).toBe('重登中 · 选择工作区')
+    expect(
+      profileTone({
+        ...base,
+        state: { ...base.state, auto_paused: 'workspace_not_found' },
+      }).text
+    ).toBe('原工作区失效')
     expect(
       profileTone({ ...base, state: { ...base.state, auto_paused: 'x' } }).text
     ).toBe('自动重登已暂停')

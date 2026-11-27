@@ -737,6 +737,17 @@ sessionKey / 授权码导入必须走该槽 SOCKS5。
 
 请求头的值与密码、2FA 一样只写不读：GET 回 `value_set`、`password_set`、`totp_set`，PUT 留空保留原值。登录服务地址公网必须 HTTPS，回环、内网与单段主机名（Docker 服务名）可用 HTTP，不允许地址里带账号密码。所有响应 `Cache-Control: no-store`。
 
+## GPT 自动使用重置券（fork）
+
+| 方法 | 路径 | 权限 | 说明 |
+|------|------|------|------|
+| GET/PUT | `/auto-reset/config` | 仅 admin | GPT 全局开关、常规触发窗口（默认 7d 开 / 5h 关 / 其他窗开）、触发门槛（`upstream_limit` \| `local_gate`）、积分优先级（默认优先重置券）、临期券动态智能抢救（默认开）及防误烧护栏（最小剩余时间、冷却、日上限、无券退避） |
+| GET | `/auto-reset/slots` | 仅 admin | 全部 GPT 槽位的自动重置模式、已知重置券、动态抢救评估、今日次数与暂停状态总览 |
+| GET | `/auto-reset/events` | 仅 admin | 最近 50 条自动重置审计记录（含常规触发、临期抢救分级与失败/暂停原因） |
+| GET/PUT/DELETE | `/vms/:id/auto-reset` | admin 或槽主 | 查看 / 更新单槽三态模式（`inherit` \| `enabled` \| `disabled`）、字段级 `overrides`（字段传 `null` 恢复继承）及 `resume` / `clear_backoff`；DELETE 还原为纯继承。他人槽位返回 404 |
+
+配置与运行态存 `settings` 表（`auto_reset_config`、`auto_reset:<vmId>`、`auto_reset_events`），无数据库迁移；仅 leader 进程运行后台调度（随 `onLeaderStop` 停止）。所有响应带 `Cache-Control: no-store`。
+
 ## 管理口（master）
 
 常用：`GET/PUT /admin/routing`、`GET /admin/vms`、`POST /admin/vms/probe-all`、`GET /admin/usage/summary`、`GET /admin/vm/oauth`、`POST /admin/vm/oauth/refresh`、`GET/PUT/DELETE /admin/intercept/rules`。`POST /admin/models/refresh` 只读本地策略目录、回完整目录，不 hop 槽位；`GET /v1/models` 同样不 hop，但按密钥 `group_type` 和 `allowed_models` 过滤。`GET/POST /admin/vm/claude-code/*` 返回 410。

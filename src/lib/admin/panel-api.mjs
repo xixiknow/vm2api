@@ -843,6 +843,7 @@ export async function buildVmList({
   role = 'admin',
   requestLog = null,
   clusterNodes = [],
+  gptIq = null,
 } = {}) {
   try {
     accountQuota?.runtimeRepo?.clearExpired?.(Date.now())
@@ -877,6 +878,15 @@ export async function buildVmList({
     })(),
     accounts,
   )
+  if (gptIq?.vmSummaryForPanel) {
+    for (const vm of vms) {
+      if (!isCodexVm(vm)) continue
+      try {
+        const iq = gptIq.vmSummaryForPanel(vm)
+        if (iq) vm.iq_check = iq
+      } catch {}
+    }
+  }
   return ok({
     items: vms,
     active_vm: active,
@@ -901,6 +911,7 @@ export async function buildVmDetail({
   slotProcessStatus = readSlotProcessStatus,
   clusterNodes = [],
   role = 'admin',
+  gptIq = null,
 }) {
   const vm = getVm(cfg.paths.project, id)
   if (!vm) {
@@ -940,6 +951,12 @@ export async function buildVmDetail({
   const cost = lookupBilling(indexBillingAccounts(billing), acc || summary)
   const gpt = isCodexVm(vm)
   applyCostFields(summary, cost, { coveredSince: billing?.log_coverage_start })
+  if (gpt && gptIq?.vmSummaryForPanel) {
+    try {
+      const iq = gptIq.vmSummaryForPanel(summary)
+      if (iq) summary.iq_check = iq
+    } catch {}
+  }
   if (billing?.lifetime_accounts) {
     applyLifetimeUsage(summary, new Map(billing.lifetime_accounts.map((row) => [row.account_id, row])))
   }

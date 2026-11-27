@@ -562,6 +562,32 @@ export class ProxyPool extends EventEmitter {
   }
 
   /**
+   * Remaining non-local proxy capacity for Codex batch import (admin pool by default).
+   * Counts only enabled, non-local, non-dead/fail, policy-allowed proxies.
+   */
+  codexEgressSummary({ ownerUserId = null } = {}) {
+    const limit = this.bindLimit()
+    const owner = normalizeOwnerId(ownerUserId)
+    let usableProxies = 0
+    let freeSlots = 0
+    for (const p of this.state.proxies) {
+      if (isLocalEgressProxy(p)) continue
+      if (proxyOwnerId(p) !== owner) continue
+      if (!p.enabled || p.status === 'dead' || p.status === 'fail') continue
+      if (proxyBlockedReason(p, this.state.config.ipv6_enabled)) continue
+      const rem = Math.max(0, limit - boundVmIdsOf(p).length)
+      if (rem <= 0) continue
+      usableProxies += 1
+      freeSlots += rem
+    }
+    return {
+      pool_usable_proxies: usableProxies,
+      pool_free_slots: freeSlots,
+      bind_limit: limit,
+    }
+  }
+
+  /**
    * Panel-facing snapshot. Quota is still the shared px-local row; this only
    * attaches per-node bound groups for admin and redacts node names / other
    * tenants' VM ids for `user`.
@@ -869,29 +895,50 @@ export class ProxyPool extends EventEmitter {
   }
 
   /** Allocate one healthy proxy with remaining capacity and bind to vmId */
-  allocateForVm(vmId, { ownerUserId = null, role = 'admin' } = {}) {
+  allocateForVm(
+    vmId,
+    { ownerUserId = null, role = 'admin', excludeLocal = false, excludeProxyIds = null, busyProxyIds = null } = {},
+  ) {
     if (!vmId) return null
     if (this.state.proxies.some((p) => proxyHasVm(p, vmId) && proxyBlockedReason(p, this.state.config.ipv6_enabled)))
       return null
     const existing = this.state.proxies.find(
-      (p) => p.enabled && !proxyBlockedReason(p, this.state.config.ipv6_enabled) && proxyHasVm(p, vmId),
+      (p) =>
+        p.enabled &&
+        !(excludeLocal && isLocalEgressProxy(p)) &&
+        !proxyBlockedReason(p, this.state.config.ipv6_enabled) &&
+        proxyHasVm(p, vmId),
     )
     if (existing) return this.publicProxy(existing)
 
     const limit = this.bindLimit()
     const owner = normalizeOwnerId(ownerUserId)
+    const excluded =
+      excludeProxyIds instanceof Set
+        ? excludeProxyIds
+        : Array.isArray(excludeProxyIds)
+          ? new Set(excludeProxyIds)
+          : null
+    const busy = busyProxyIds instanceof Set ? busyProxyIds : Array.isArray(busyProxyIds) ? new Set(busyProxyIds) : null
     const localTarget = this.localTargetForVm(vmId)
-    if (localTarget !== LOCAL_EGRESS_ID && this.state.proxies.some((p) => p.id === LOCAL_EGRESS_ID)) {
+    if (!excludeLocal && localTarget !== LOCAL_EGRESS_ID && this.state.proxies.some((p) => p.id === LOCAL_EGRESS_ID)) {
       this.ensureLocalForNode(localEgressNodeId(localTarget))
     }
     const candidates = this.state.proxies.filter((p) => {
+      if (excludeLocal && isLocalEgressProxy(p)) return false
       if (isLocalEgressProxy(p) && p.id !== localTarget) return false
+      if (excluded?.has(p.id)) return false
       if (!p.enabled || p.status === 'dead' || p.status === 'fail') return false
       if (proxyBlockedReason(p, this.state.config.ipv6_enabled)) return false
       if (boundVmIdsOf(p).length >= limit) return false
       return proxyOwnerId(p) === owner
     })
     candidates.sort((a, b) => {
+      if (busy) {
+        const ba = busy.has(a.id) ? 1 : 0
+        const bb = busy.has(b.id) ? 1 : 0
+        if (ba !== bb) return ba - bb
+      }
       const score = (x) => (x.status === 'ok' ? 0 : x.status === 'unknown' ? 1 : 2)
       if (score(a) !== score(b)) return score(a) - score(b)
       return boundVmIdsOf(a).length - boundVmIdsOf(b).length

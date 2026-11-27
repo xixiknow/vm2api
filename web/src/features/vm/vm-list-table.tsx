@@ -43,7 +43,12 @@ import {
   SLOT_BG,
   type SlotState,
 } from '@/lib/vm-health'
-import { clipLabel, formatSlotEmail, slotRawEmail } from '@/lib/vm-kind'
+import {
+  clipLabel,
+  formatSlotEmail,
+  isCodexVm,
+  slotRawEmail,
+} from '@/lib/vm-kind'
 import {
   claudeTier,
   poolStatus,
@@ -56,6 +61,7 @@ import { vmCostLedger, vmTodayStats, vmWeekOutcome } from '@/lib/vm-usage'
 import { useNow } from '@/hooks/use-now'
 import { Button } from '@/components/ui/button'
 import { StatusMark } from '@/components/status-mark'
+import { IqHealthPill } from '@/features/gpt-iq/iq-badge'
 import { ProxyChip } from '@/features/proxies/proxy-chip'
 import {
   SchedulableSwitch,
@@ -89,7 +95,7 @@ const ROW_INTERACTIVE =
  */
 const GRID: CSSProperties = {
   gridTemplateColumns:
-    '34px minmax(240px,1.5fr) minmax(250px,1.3fr) minmax(190px,0.95fr) repeat(3,minmax(104px,0.55fr)) 48px 46px 40px 40px 80px 60px 62px 64px 56px',
+    '34px minmax(240px,1.5fr) minmax(250px,1.3fr) minmax(244px,1.12fr) repeat(3,minmax(104px,0.55fr)) 48px 46px 40px 40px 80px 60px 62px 64px 56px',
 }
 
 /** 悬停才出现的次要信息。 */
@@ -298,6 +304,7 @@ function HealthCell({ vm }: { vm: Vm }) {
       ) : (
         <span className={TERT}>24h 无请求</span>
       )}
+      <IqHealthPill vm={vm} />
     </>
   )
 }
@@ -639,6 +646,8 @@ type Agg = {
   cap: number
   queue: number
   queued: number
+  iqNormal: number
+  iqDegraded: number
   by: Record<VmZone, number>
   top: RowData | null
 }
@@ -655,6 +664,8 @@ function aggregate(rows: RowData[]): Agg {
     cap: 0,
     queue: 0,
     queued: 0,
+    iqNormal: 0,
+    iqDegraded: 0,
     by: emptyZoneCounts(),
     top: null,
   }
@@ -668,6 +679,11 @@ function aggregate(rows: RowData[]): Agg {
     a.cap += r.seatsMax ?? 0
     a.queue += r.queue
     if (r.queue) a.queued++
+    if (isCodexVm(r.vm) && r.vm.iq_check) {
+      const iq = r.vm.iq_check
+      if (iq.isolated || iq.status === 'degraded') a.iqDegraded++
+      else if (iq.status === 'normal') a.iqNormal++
+    }
     a.by[zoneOf(r.vm)]++
     if (r.spend && (!a.top || r.spend > a.top.spend)) a.top = r
   }
@@ -749,7 +765,21 @@ function SummaryBar({ a }: { a: Agg }) {
       <Kpi
         k='24h 成功率'
         v={fmtHealthPct(pct)}
-        x={`失败 ${fmtNum(a.req - a.ok)}`}
+        x={
+          a.iqNormal > 0 || a.iqDegraded > 0 ? (
+            <>
+              失败 {fmtNum(a.req - a.ok)} · 测智 {a.iqNormal} 满血
+              {a.iqDegraded > 0 ? (
+                <span className='font-semibold text-[color:var(--status-bad)]'>
+                  {' '}
+                  · {a.iqDegraded} 降智
+                </span>
+              ) : null}
+            </>
+          ) : (
+            `失败 ${fmtNum(a.req - a.ok)}`
+          )
+        }
         tone={HEALTH_FG[healthTone(pct)]}
       />
       <Kpi
@@ -941,7 +971,7 @@ export function VmTable({
         className='group/tbl overflow-x-auto rounded-lg border border-border/60 bg-card text-[12.5px]'
       >
         <div
-          className='min-w-[1408px]'
+          className='min-w-[1462px]'
           role='table'
           aria-label='槽位列表'
           style={zoom === 100 ? undefined : { zoom: zoom / 100 }}

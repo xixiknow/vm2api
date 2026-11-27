@@ -100,9 +100,9 @@ export function GeminiTestPanel({
           : null
   const licenseBlocked =
     !unavailable &&
-      isOAuth &&
-      environment.crag_license &&
-      environment.crag_license.valid === false
+    isOAuth &&
+    environment.crag_license &&
+    environment.crag_license.valid === false
       ? '请先在「账号」绑定 CRAGGemini 订阅席位，再发起 OAuth 测试对话。'
       : null
   const pull = useGeminiMutation({
@@ -116,7 +116,7 @@ export function GeminiTestPanel({
     : null
   const models =
     environment.models_discovered === true &&
-      modelError?.code !== 'gemini_models_empty'
+    modelError?.code !== 'gemini_models_empty'
       ? [...new Set(environment.models.filter(Boolean))]
       : []
   const modelGroups = groupGeminiModels(
