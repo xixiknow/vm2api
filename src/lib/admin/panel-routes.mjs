@@ -42,13 +42,21 @@ import {
   publicJevConfig,
   publicJevKeys,
   readJevConfig,
+  resumeJevKeys,
 } from '../protocol/jev-intercept.mjs'
 import { JevUsageRepo } from '../db/repos/jev-usage-repo.mjs'
 import { RefusalGuardsRepo } from '../db/repos/refusal-guards-repo.mjs'
 import { RefusalDeviceBlocksRepo } from '../db/repos/refusal-device-blocks-repo.mjs'
 import { RefusalSessionBlocksRepo } from '../db/repos/refusal-session-blocks-repo.mjs'
 import { SettingsRepo } from '../db/repos/settings-repo.mjs'
-import { parseCodexImportPayload, upsertCodexAccount, readCodexAccounts } from '../vm/codex-slot.mjs'
+import {
+  parseCodexImportPayload,
+  upsertCodexAccount,
+  readCodexAccounts,
+  persistCodexCredentialState,
+  markCodexGrantDead,
+} from '../vm/codex-slot.mjs'
+import { clearOpenAIAccountHold } from '../pool/openai-account-runtime.mjs'
 import { generateAuthUrl, exchangeAuthCode, normalizeOauthFlavor } from '../oauth/oauth-auth-url.mjs'
 import { sessionKeyToOAuth, panelImportErrorPayload } from '../oauth/cookie-auth.mjs'
 import { enrichOauthIdentity } from '../oauth/oauth-identity.mjs'
@@ -351,7 +359,11 @@ import {
 import { createCragSubscriptionHandler, cragSubscriptionRoute } from './crag-subscription-routes.mjs'
 import { restartRustKernel, syncClaudeKernelConfigs, writeKernelConfig } from '../transport/rust-kernel-supervisor.mjs'
 
-import { countTokensViaWorker, syncClaudeClientCredentials } from '../transport/go-worker-client.mjs'
+import {
+  countTokensViaWorker,
+  syncClaudeClientCredentials,
+  withCredentialRefreshLock,
+} from '../transport/go-worker-client.mjs'
 import { apiKeyBetaHeader, setupTokenBetaHeader } from '../protocol/claude-code-betas.mjs'
 import { countTokensEnabled } from '../protocol/user-count-tokens.mjs'
 import { rustKernelHealth, toPublicKernelHealth } from '../transport/rust-kernel-client.mjs'
@@ -475,8 +487,11 @@ function usageLogFilters(req, u) {
     model: get('model'),
     endpoint: get('endpoint'),
     protocol: get('protocol'),
+    via: get('via'),
+    final_state: get('final_state'),
     status_code: get('status_code'),
     upstream_400: get('upstream_400') === '1',
+    upstream_risk_errors: get('upstream_risk_errors') === '1',
     request_id: get('request_id'),
     exclude_status_200: get('exclude_status_200') === '1',
     failed_only: get('failed_only') === '1',
@@ -575,6 +590,9 @@ async function commitImportedCodexVm({
   if (saved.access_token || saved.refresh_token) {
     const reopened = clearUnschedulable(cfg.paths.project, existing.id, { by: 'credential_import' })
     if (reopened) Object.assign(existing, getVm(cfg.paths.project, existing.id) || {})
+    // 凭证换新同时清进程内存 hold（含 grant-death 的 MAX_SAFE_INTEGER 永久占位），
+    // 否则复活号磁盘健康但调度层恒 cooldown，直到进程重启才回池。
+    clearOpenAIAccountHold(existing.id)
   }
   let catalog = null
   try {
@@ -1275,7 +1293,7 @@ export function createPanelHandler(ctx) {
             const row = byFp.get(key.key_fingerprint)
             return {
               ...key,
-              status: key.retired ? 'paused' : row?.status || key.status,
+              status: row?.status || key.status,
               last_http_status: row?.last_http_status ?? key.last_http_status ?? null,
             }
           }),
@@ -1738,6 +1756,7 @@ export function createPanelHandler(ctx) {
     ctx.routingConfig = previous
     ctx.healthMonitor?.setConfig(ctx.routingConfig.health_probe)
     ctx.usageProbeMonitor?.setConfig(ctx.routingConfig.usage_probe)
+    ctx.cragZombieGuard?.setConfig(ctx.routingConfig.crag_zombie_guard)
     ctx.notifyMonitor?.setConfig(ctx.routingConfig.notify)
     if (ctx.routingConfig.logging) {
       requestLog.setConfig({
@@ -6985,22 +7004,63 @@ export function createPanelHandler(ctx) {
               error: { code: 'credential_mode_unsupported', message: 'GPT 槽没有 refresh_token，请重新导入 OAuth' },
             })
           }
-          const tok = await refreshCodexAccessToken({
-            refreshToken,
-            proxyUrl: hostProxyUrlForVm(vm),
+          // 共锁（key=codex:<vmId>）且锁内重读凭证：等待期间并发方轮换出的新票
+          // 直接采用，不用锁外捕获的旧 RT 重放、也不用旧票元数据落盘。
+          const tok = await withCredentialRefreshLock(`codex:${id}`, async () => {
+            const current = readCodexAccounts(cfg.paths.project, id)[0] || {}
+            const liveRefreshToken = String(current.refresh_token || '').trim()
+            if (!liveRefreshToken) return { ok: false, error: 'credential_mode_unsupported' }
+            const result = await refreshCodexAccessToken({
+              refreshToken: liveRefreshToken,
+              proxyUrl: hostProxyUrlForVm(vm),
+            })
+            if (!result?.ok) return result
+            const latest = readCodexAccounts(cfg.paths.project, id)[0] || {}
+            if (latest.refresh_token && latest.refresh_token !== liveRefreshToken) {
+              // 并发方已轮换：直接采用其新票，本方轮换结果作废。
+              return { ok: true, adopted: true }
+            }
+            upsertCodexAccount(cfg.paths.project, id, {
+              access_token: result.access_token,
+              refresh_token: result.refresh_token,
+              id_token: result.id_token || latest.id_token,
+              expires_at: result.expires_at || latest.expires_at,
+            })
+            return result
           })
-          if (!tok.ok) {
-            return json(res, 502, {
+          if (tok?.error === 'credential_mode_unsupported') {
+            return json(res, 400, {
               ok: false,
-              error: { code: tok.error || 'refresh_failed', message: 'GPT OAuth 刷新失败，请重新导入' },
+              error: { code: 'credential_mode_unsupported', message: 'GPT 槽没有 refresh_token，请重新导入 OAuth' },
             })
           }
-          upsertCodexAccount(cfg.paths.project, id, {
-            access_token: tok.access_token,
-            refresh_token: tok.refresh_token,
-            id_token: tok.id_token || first.id_token,
-            expires_at: tok.expires_at || first.expires_at,
-          })
+          if (!tok.ok) {
+            // 操作员手动刷新=最强的死活证据源：吊销结论立即落盘摘池（面板显示
+            // 「不可调度 · 凭证吊销」），其余失败维持现状只回 502。
+            if (tok.error === 'oauth_revoked') {
+              try {
+                persistCodexCredentialState(cfg.paths.project, id, { error: 'oauth_revoked' })
+                markCodexGrantDead(cfg.paths.project, id, {
+                  description: tok.description || 'oauth_revoked',
+                  status: tok.status || null,
+                })
+              } catch {}
+            }
+            const message =
+              tok.error === 'oauth_revoked'
+                ? 'GPT OAuth 凭证已被吊销，需重新授权导入'
+                : 'GPT OAuth 刷新失败，请重新导入'
+            return json(res, 502, {
+              ok: false,
+              error: { code: tok.error || 'refresh_failed', message },
+            })
+          }
+          // upsert 已在锁内完成（并发轮换时采用对方新票）；成功=活票：
+          // 清掉 grant-death 内存 hold 与陈旧吊销标。
+          clearOpenAIAccountHold(id)
+          try {
+            persistCodexCredentialState(cfg.paths.project, id, { error: null })
+          } catch {}
           return json(res, 200, panel.ok({ ok: true, refreshed: true, platform: 'openai' }))
         }
         if (isApiKeyMode(vm?.claude?.mode)) {
@@ -7587,13 +7647,18 @@ export function createPanelHandler(ctx) {
       if (req.method === 'DELETE' && p === '/api/panel/refusal-device-blocks') {
         const body = await readBody(req, 8 * 1024).catch(() => ({}))
         const repo = new RefusalDeviceBlocksRepo()
+        const sessionsRepo = new RefusalSessionBlocksRepo()
         const deviceId = String(body?.device_id || '').trim()
         if (deviceId) {
+          const existing = repo.get(deviceId)
           if (!repo.remove(deviceId)) {
             return json(res, 404, {
               ok: false,
               error: { type: 'not_found_error', code: 'refusal_device_not_found', message: 'device 不存在' },
             })
+          }
+          if (existing?.subject_kind === 'session' && existing.session_id) {
+            sessionsRepo.remove(existing.session_id)
           }
           return json(res, 200, panel.ok(refusalGuardSnapshot()))
         }
@@ -7608,6 +7673,7 @@ export function createPanelHandler(ctx) {
           })
         }
         repo.clear()
+        sessionsRepo.clear()
         return json(res, 200, panel.ok(refusalGuardSnapshot()))
       }
       if (req.method === 'GET' && p === '/api/panel/protocol-entry') {
@@ -7703,6 +7769,23 @@ export function createPanelHandler(ctx) {
             },
           })
         }
+      }
+      if (req.method === 'POST' && p === '/api/panel/jev-intercept/resume') {
+        if (panelIdentity(req).role !== 'admin') {
+          return json(res, 403, { ok: false, error: { code: 'forbidden', message: '仅管理员可恢复审核密钥' } })
+        }
+        const body = await readBody(req, 8192).catch(() => ({}))
+        const fingerprint = body?.key_fingerprint == null ? '' : String(body.key_fingerprint).trim()
+        if (fingerprint && !/^[a-f0-9]{12}$/.test(fingerprint)) {
+          return json(res, 400, {
+            ok: false,
+            error: { type: 'invalid_request_error', code: 'invalid_key_fingerprint', message: '无效的密钥指纹' },
+          })
+        }
+        const stored = readJevConfig((key, fallback) => new SettingsRepo().get(key, fallback))
+        const resumed = resumeJevKeys(stored, fingerprint)
+        const keys = publicJevKeys(stored)
+        return json(res, 200, panel.ok({ resumed, keys }))
       }
       if (req.method === 'GET' && p === '/api/panel/notify') {
         return json(

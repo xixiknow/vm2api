@@ -33,6 +33,17 @@ import time
 from datetime import datetime, timezone
 from urllib.parse import parse_qs, urlsplit, urlunsplit
 
+_SCRIPT_DIR = Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+
+from gemini_host_apparmor import (
+    active_host_root,
+    managed_bwrap_entry_configured,
+    managed_bwrap_required,
+    resolve_bwrap_argv0,
+)
+
 ROOT = Path(__file__).resolve().parents[1]
 MAX_NETNS_SLOTS = 8
 MAX_ENVIRONMENTS = 256
@@ -93,6 +104,11 @@ ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 CODE = re.compile(r"[A-Za-z0-9._~/-]{1,2048}\Z")
 API_KEY = re.compile(r"[A-Za-z0-9_-]{20,256}\Z")
 OAUTH_ACCESS_TOKEN = re.compile(r"[A-Za-z0-9._~+/-]{1,4096}={0,2}\Z")
+OAUTH_REFRESH_TOKEN = re.compile(r"1//[0-9A-Za-z._~+/-]{6,2048}\Z")
+OAUTH_AUTH_METHODS = frozenset(
+    {"consumer", "personal_consumer", "gcp", "business_licensed_enterprise"}
+)
+WIF_PROVIDER = re.compile(r"[A-Za-z0-9._:/-]{1,512}\Z")
 RELEASE_CODE = re.compile(r"CGG1-[A-Za-z0-9_-]{43}\Z")
 SHA256 = re.compile(r"[a-f0-9]{64}\Z")
 MANUAL_RELEASE = Path("/etc/vm2api/gemini-release.json")
@@ -224,6 +240,43 @@ def extract_permit_payload_key_id(code):
     return None
 
 
+BWRAP_FATAL_STDERR = re.compile(rb"bwrap:\s+(?!warning\b)", re.I)
+BWRAP_BIND_MOUNT_STDERR = re.compile(
+    rb"can't find source path|can't bind mount|can't mount proc|"
+    rb"failed to (?:open|mount)|no such file or directory|"
+    rb"execvp\s+\S+:\s*permission\s+denied",
+    re.I,
+)
+
+
+def _bwrap_fatal_stderr(stderr):
+    if not isinstance(stderr, str) or not stderr.strip():
+        return None
+    fatal_lines = []
+    for line in stderr.splitlines():
+        stripped = line.lstrip()
+        lower = stripped.lower()
+        if lower.startswith("bwrap:") and not lower.startswith("bwrap: warning"):
+            fatal_lines.append(stripped)
+    if not fatal_lines:
+        return None
+    return "\n".join(fatal_lines)
+
+
+def _classify_bwrap_launch_stderr(stderr, *, host_root=Path("/")):
+    fatal = _bwrap_fatal_stderr(stderr)
+    if fatal is None:
+        return None
+    raw = fatal.encode("utf-8", errors="replace")
+    if not BWRAP_FATAL_STDERR.search(raw):
+        return None
+    if BWRAP_BIND_MOUNT_STDERR.search(raw):
+        return 503, "gemini_sandbox_unavailable"
+    if _apparmor_sandbox_evidence(raw, host_root=host_root):
+        return 503, "gemini_sandbox_apparmor_restricted"
+    return 503, "gemini_sandbox_unavailable"
+
+
 def classify_craggemini_license_cli_error(stdout, stderr, *, sync_pending=False):
     if isinstance(stdout, str) and stdout.strip():
         try:
@@ -258,6 +311,9 @@ def classify_craggemini_license_cli_error(stdout, stderr, *, sync_pending=False)
         or "permit or registration code is required" in text
     ):
         return 403, "license_required"
+    sandbox = _classify_bwrap_launch_stderr(stderr)
+    if sandbox is not None:
+        return sandbox
     if sync_pending:
         return 503, "gemini_subscription_sync_pending"
     return 403, "license_invalid"
@@ -552,13 +608,29 @@ def strip_unsupported_kernel_policy(kernel_cfg, version):
         kernel_cfg.pop(field, None)
     return kernel_cfg
 BLOCKING_ACCOUNT_ELIGIBILITIES = frozenset(
-    {"verification_required", "location_unsupported", "ineligible"}
+    {
+        "verification_required",
+        "location_unsupported",
+        "client_unsupported",
+        "ineligible",
+    }
 )
 
 
-def session_diagnostic(session, *, final=False):
+ADVISORY_SESSION_DIAGNOSTICS = frozenset({"gemini_client_unsupported"})
+
+
+def session_diagnostic(session, *, final=False, include_advisory=False):
     diag = getattr(session, "native_diagnostic", None)
-    return diag.poll(final=final) if diag is not None else None
+    if diag is None:
+        return None
+    if not include_advisory:
+        try:
+            code = diag.poll(final=final, include_advisory=False)
+        except TypeError:
+            code = diag.poll(final=final)
+        return None if code in ADVISORY_SESSION_DIAGNOSTICS else code
+    return diag.poll(final=final)
 MAX_INFER_BODY = 12 * 1024 * 1024
 NATIVE_RUNTIME_ROOT = Path("/run/vm2api-gemini-native")
 FULL_CAPABILITIES = (
@@ -587,6 +659,7 @@ INFERENCE_ERROR_CODES = frozenset(
         "gemini_account_ineligible",
         "gemini_account_verification_required",
         "gemini_api_key_invalid",
+        "gemini_client_unsupported",
         "gemini_inference_bad_input",
         "gemini_inference_cancelled",
         "gemini_inference_failed",
@@ -718,6 +791,13 @@ def _apparmor_sandbox_evidence(stderr_bytes=b"", *, host_root=Path("/")):
     return lacks_profile or stderr_match
 
 
+def _bwrap_tool_available():
+    if shutil.which("bwrap", path=SYSTEM_ENV["PATH"]):
+        return True
+    entry = Path(resolve_bwrap_argv0(host_root=active_host_root()))
+    return entry.is_file() and os.access(entry, os.X_OK)
+
+
 def _sandbox_probe_command(uid, *, true_bin=None):
     if true_bin is None:
         true_bin = "/usr/bin/true" if os.path.exists("/usr/bin/true") else "/bin/true"
@@ -732,7 +812,7 @@ def _sandbox_probe_command(uid, *, true_bin=None):
         "--inh-caps=-all",
         "--ambient-caps=-all",
         "--bounding-set=-all",
-        "bwrap",
+        resolve_bwrap_argv0(host_root=active_host_root()),
         "--unshare-pid",
         "--unshare-ipc",
         "--unshare-uts",
@@ -909,13 +989,33 @@ def account_command(uid, method, profile=None):
     ]
 
 
-def read_account(uid, proxy_url, method, api_key=None, profile=None, oauth_token=None):
+OAUTH_CLIENT_ENV_KEYS = (
+    "KIN_GEMINI_OAUTH_CONSUMER_CLIENT_ID",
+    "KIN_GEMINI_OAUTH_CONSUMER_CLIENT_SECRET",
+    "KIN_GEMINI_OAUTH_CLOUD_CLIENT_ID",
+    "KIN_GEMINI_OAUTH_CLOUD_CLIENT_SECRET",
+    "KIN_GEMINI_OAUTH_WIF_CLIENT_ID",
+)
+
+
+def read_account(
+    uid, proxy_url, method, api_key=None, profile=None, oauth_token=None, *, timeout=17
+):
+    payload = {"proxy_url": proxy_url, "api_key": api_key, "oauth_token": oauth_token}
+    if method == "oauth_refresh_import":
+        oauth_clients = {
+            key: os.environ[key].strip()
+            for key in OAUTH_CLIENT_ENV_KEYS
+            if isinstance(os.environ.get(key), str) and os.environ[key].strip()
+        }
+        if oauth_clients:
+            payload["oauth_clients"] = oauth_clients
     try:
         result = subprocess.run(
             account_command(uid, method, profile),
-            input=json.dumps({"proxy_url": proxy_url, "api_key": api_key, "oauth_token": oauth_token}).encode(),
+            input=json.dumps(payload).encode(),
             check=True,
-            timeout=17,
+            timeout=timeout,
             capture_output=True,
             env=SYSTEM_ENV,
         )
@@ -1372,7 +1472,7 @@ class Agy:
             except (Failure, OSError, subprocess.SubprocessError) as err:
                 raise Failure(503, getattr(err, "code", None), stage="egress_start") from err
         sandbox = [
-            "bwrap",
+            resolve_bwrap_argv0(host_root=active_host_root()),
             "--unshare-pid",
             "--unshare-ipc",
             "--unshare-uts",
@@ -2054,10 +2154,13 @@ class NativeAgy(Agy):
             }
         result = self.native_invocation.poll()
         if result["state"] == "completed":
+            if hasattr(self.native_diagnostic, "clear_advisory"):
+                self.native_diagnostic.clear_advisory()
             return result
         wrapper_exited = self.native_tui is None or self.native_tui.poll() is not None
-        diagnostic = self.native_diagnostic.poll(
-            final=wrapper_exited or result["state"] != "running"
+        terminal = wrapper_exited or result["state"] != "running"
+        diagnostic = session_diagnostic(
+            self, final=terminal, include_advisory=terminal
         )
         if diagnostic is not None:
             return {
@@ -2247,7 +2350,15 @@ class NativeSession(NativeAgy):
                 return True
         return self._health_failures >= NATIVE_HEALTH_FAIL_THRESHOLD
 
-    def open_stream(self, request_id, body_obj, *, model=None, gateway_policy=None):
+    def open_stream(
+        self,
+        request_id,
+        body_obj,
+        *,
+        model=None,
+        gateway_policy=None,
+        restart_resume=False,
+    ):
         native_mod = native_module()
         if not self.is_alive():
             raise native_mod.launcher_exit_failure(self.read_exit_detail())
@@ -2265,6 +2376,7 @@ class NativeSession(NativeAgy):
             body_obj,
             startup_timeout=45,
             gateway_policy=gateway_policy,
+            restart_resume=restart_resume,
             diagnostic=self.native_diagnostic,
             is_alive=self.is_alive,
             exit_reader=self.read_exit_detail,
@@ -2664,7 +2776,7 @@ class CragDaemonShard:
             "--inh-caps=-all",
             "--ambient-caps=-all",
             "--bounding-set=-all",
-            "bwrap",
+            resolve_bwrap_argv0(host_root=active_host_root()),
             "--unshare-pid",
             "--unshare-ipc",
             "--unshare-uts",
@@ -2926,7 +3038,14 @@ class CragDaemonShard:
         return native_module().launcher_exit_code(self.read_exit_detail())
 
     def open_stream(
-        self, env_id, request_id, body_obj, *, model=None, gateway_policy=None
+        self,
+        env_id,
+        request_id,
+        body_obj,
+        *,
+        model=None,
+        gateway_policy=None,
+        restart_resume=False,
     ):
         native_mod = native_module()
         if not self.is_alive():
@@ -2946,6 +3065,7 @@ class CragDaemonShard:
             body_obj,
             startup_timeout=45,
             gateway_policy=gateway_policy,
+            restart_resume=restart_resume,
             account_id=env_id,
             is_alive=self.is_alive,
             exit_reader=self.read_exit_detail,
@@ -3038,11 +3158,7 @@ class ResidentTestChatRun:
         )
 
     def poll(self):
-        diagnostic = (
-            self.session.native_diagnostic.poll()
-            if self.session.native_diagnostic is not None
-            else None
-        )
+        diagnostic = session_diagnostic(self.session, include_advisory=False)
         if diagnostic is not None:
             self._done = True
             return {"state": "failed", "text": "", "error": {"code": diagnostic}}
@@ -3050,7 +3166,11 @@ class ResidentTestChatRun:
         if result["state"] != "running":
             self._done = True
             self.session.last_used = time.monotonic()
-            if result["state"] == "failed" and self.session.native_diagnostic is not None:
+            if result["state"] == "completed":
+                diag = getattr(self.session, "native_diagnostic", None)
+                if diag is not None and hasattr(diag, "clear_advisory"):
+                    diag.clear_advisory()
+            elif result["state"] == "failed" and self.session.native_diagnostic is not None:
                 final_diag = self.session.native_diagnostic.poll(final=True)
                 if final_diag is not None:
                     return {"state": "failed", "text": "", "error": {"code": final_diag}}
@@ -4294,11 +4414,13 @@ class Host:
         return {"kernel_version": self.payload_version}
 
     def _run_sandbox_probe(self):
-        if any(
-            not shutil.which(tool, path=SYSTEM_ENV["PATH"])
-            for tool in ("setpriv", "bwrap")
-        ):
+        if not shutil.which("setpriv", path=SYSTEM_ENV["PATH"]) or not _bwrap_tool_available():
             return "gemini_sandbox_unavailable"
+        host_root = active_host_root()
+        if managed_bwrap_required(host_root=host_root) and not managed_bwrap_entry_configured(
+            host_root=host_root
+        ):
+            return "gemini_sandbox_apparmor_restricted"
         argv = _sandbox_probe_command(self.uid_base)
         try:
             rc, stderr_bytes = _run_bounded_probe(argv)
@@ -4334,8 +4456,8 @@ class Host:
     def oauth_runtime_issue(self):
         if any(
             not shutil.which(tool, path=SYSTEM_ENV["PATH"])
-            for tool in ("ip", "nft", "setpriv", "bwrap", "curl", "openvt")
-        ):
+            for tool in ("ip", "nft", "setpriv", "curl", "openvt")
+        ) or not _bwrap_tool_available():
             return "gemini_oauth_tools_missing"
         try:
             check_root_owned(self.egress)
@@ -5129,6 +5251,7 @@ class Host:
         if error_code not in (
             "gemini_account_verification_required",
             "gemini_location_unsupported",
+            "gemini_client_unsupported",
             "gemini_account_ineligible",
         ):
             return
@@ -5139,6 +5262,7 @@ class Host:
         mapped = {
             "gemini_account_verification_required": "verification_required",
             "gemini_location_unsupported": "location_unsupported",
+            "gemini_client_unsupported": "client_unsupported",
             "gemini_account_ineligible": "ineligible",
         }[error_code]
         account.pop("eligibility_verified_at", None)
@@ -5308,6 +5432,7 @@ class Host:
                 elif err_code in (
                     "gemini_account_verification_required",
                     "gemini_location_unsupported",
+                    "gemini_client_unsupported",
                     "gemini_account_ineligible",
                 ):
                     with self.lock:
@@ -6144,7 +6269,7 @@ class Host:
                 "--inh-caps=-all",
                 "--ambient-caps=-all",
                 "--bounding-set=-all",
-                "bwrap",
+                resolve_bwrap_argv0(host_root=active_host_root()),
                 "--unshare-pid",
                 "--unshare-ipc",
                 "--unshare-uts",
@@ -6411,7 +6536,11 @@ class Host:
             status.setdefault("product", "craggemini")
             status["seat_required"] = True
         except Failure as error:
-            code = error.code if error.code in LICENSE_ERROR_CODES else "license_unconfigured"
+            code = (
+                error.code
+                if error.code in LICENSE_ERROR_CODES or error.code in SANDBOX_ERROR_CODES
+                else "license_unconfigured"
+            )
             status = {
                 "product": "craggemini",
                 "status": (
@@ -6541,6 +6670,45 @@ class Host:
             self.uid_base + (slot % MAX_NETNS_SLOTS), proxy_url, "oauth_import", oauth_token=credential
         )
 
+    def probe_refresh_imported_account(self, slot, proxy_url, credential):
+        result = read_account(
+            self.uid_base + (slot % MAX_NETNS_SLOTS),
+            proxy_url,
+            "oauth_refresh_import",
+            oauth_token=credential,
+            timeout=25,
+        )
+        if not isinstance(result, dict):
+            return {"account": {"state": "error", "checked_at": now()}}
+        if isinstance(result.get("account"), dict):
+            return result
+        return {"account": result}
+
+    def _write_imported_profile(self, env_dir, uid, token_doc, project_id=None):
+        profile_id = secrets.token_hex(16)
+        profile_dir = env_dir / profile_id
+        profile_dir.mkdir(mode=0o711)
+        home = profile_dir / "home"
+        settings = home / ".gemini" / "antigravity-cli"
+        for private in (home, home / ".gemini", settings):
+            private.mkdir(mode=0o700)
+            os.chown(private, uid, uid)
+        settings_file = settings / "settings.json"
+        private_json(settings_file, CLI_SETTINGS)
+        os.chown(settings_file, uid, uid)
+        token_file = settings / TOKEN_NAME
+        private_json(token_file, token_doc)
+        os.chown(token_file, uid, uid)
+        if isinstance(project_id, str) and 1 <= len(project_id.strip()) <= 128:
+            cache_dir = settings / "cache"
+            cache_dir.mkdir(mode=0o700, exist_ok=True)
+            os.chown(cache_dir, uid, uid)
+            proj_file = cache_dir / "default_project_id.txt"
+            proj_file.write_text(project_id.strip() + "\n", encoding="utf-8")
+            os.chmod(proj_file, 0o600)
+            os.chown(proj_file, uid, uid)
+        return profile_id
+
     def refresh_account(self, env, proxy_url, *, auto_pull_models=True):
         directory = self.directory / env["id"]
         if env.get("auth_method") == "api_key":
@@ -6638,7 +6806,7 @@ class Host:
                 or prev_verified_at
             )
             if inference_proven and (
-                account.get("eligibility") == "verification_required"
+                account.get("eligibility") in ("verification_required", "client_unsupported")
                 or (
                     account.get("eligibility") is None
                     and "validation_url" in account
@@ -6654,6 +6822,17 @@ class Host:
                 ):
                     previous["data_at"] = previous.get("checked_at")
                 previous.update(state=account["state"], checked_at=account["checked_at"])
+                for err_key in (
+                    "error_code",
+                    "error_message",
+                    "http_status",
+                    "eligibility",
+                    "validation_url",
+                ):
+                    if account.get(err_key) is not None:
+                        previous[err_key] = account[err_key]
+                    elif err_key in ("error_code", "error_message", "http_status"):
+                        previous.pop(err_key, None)
             else:
                 env["account"] = account
             if account.get("state") == "reauth_required":
@@ -6896,6 +7075,16 @@ class Host:
                 "version": self.payload_version,
                 "activation_required": self.payload_state == "awaiting_redemption",
             }
+        if operation == "ensure-payload":
+            if body:
+                raise Failure(400)
+            self.ensure_payload()
+            self._invalidate_license_cache()
+            return {
+                "version": self.payload_version,
+                "payload_state": self.payload_state,
+                "payload_mode": self.payload_mode,
+            }
         if operation == "redeem":
             result = self.redeem_payload(body.get("redemption_code"))
             self._invalidate_license_cache()
@@ -6942,19 +7131,47 @@ class Host:
                 raise Failure(400, "gemini_invalid_concurrency")
             imported = body.get("oauth_account")
             credential = None
+            refresh_credential = None
             if imported is not None:
                 if method != "oauth" or not isinstance(imported, dict):
                     raise Failure(400, "gemini_oauth_import_invalid")
+                refresh = imported.get("refresh_token")
                 access = imported.get("access_token")
                 expiry = imported.get("expiry_timestamp")
-                if (
-                    not isinstance(access, str)
-                    or not OAUTH_ACCESS_TOKEN.fullmatch(access)
-                    or type(expiry) is not int
-                    or not 0 < expiry < 253402300800
+                auth_method_hint = imported.get("auth_method")
+                wif_provider = imported.get("wif_provider")
+                if auth_method_hint is not None and (
+                    not isinstance(auth_method_hint, str)
+                    or auth_method_hint not in OAUTH_AUTH_METHODS
                 ):
                     raise Failure(400, "gemini_oauth_import_invalid")
-                credential = {"access_token": access, "expiry": expiry}
+                if wif_provider is not None and (
+                    not isinstance(wif_provider, str)
+                    or not WIF_PROVIDER.fullmatch(wif_provider)
+                ):
+                    raise Failure(400, "gemini_oauth_import_invalid")
+                has_access_pair = access is not None or expiry is not None
+                if has_access_pair:
+                    if (
+                        not isinstance(access, str)
+                        or not OAUTH_ACCESS_TOKEN.fullmatch(access)
+                        or type(expiry) is not int
+                        or not 0 < expiry < 253402300800
+                    ):
+                        raise Failure(400, "gemini_oauth_import_invalid")
+                if refresh is not None:
+                    if not isinstance(refresh, str) or not OAUTH_REFRESH_TOKEN.fullmatch(refresh):
+                        raise Failure(400, "gemini_oauth_import_invalid")
+                    refresh_credential = {
+                        "refresh_token": refresh,
+                        **({"access_token": access, "expiry": expiry} if has_access_pair else {}),
+                        **({"auth_method": auth_method_hint} if auth_method_hint else {}),
+                        **({"wif_provider": wif_provider} if wif_provider else {}),
+                    }
+                elif has_access_pair:
+                    credential = {"access_token": access, "expiry": expiry}
+                else:
+                    raise Failure(400, "gemini_oauth_import_invalid")
             taken = {env["slot"] for env in self.environments.values()}
             slot = next(
                 (slot for slot in range(MAX_ENVIRONMENTS) if slot not in taken), None
@@ -6964,6 +7181,7 @@ class Host:
             self.ensure_payload()
             account = {}
             call_models = None
+            imported_token_doc = None
             if method == "api_key":
                 account = read_account(
                     self.uid_base + (slot % MAX_NETNS_SLOTS), proxy_url, "api_key", api_key=api_key
@@ -6979,7 +7197,25 @@ class Host:
                     "models"
                 ):
                     call_models = chat_data["models"]
-            if credential:
+            if refresh_credential:
+                refresh_result = self.probe_refresh_imported_account(
+                    slot, proxy_url, refresh_credential
+                )
+                account = refresh_result.get("account") or {"state": "error", "checked_at": now()}
+                if account.get("state") == "reauth_required":
+                    raise Failure(400, "gemini_oauth_import_rejected")
+                if account.get("state") not in ("ok", "partial"):
+                    raise Failure(502, "gemini_account_read_failed")
+                if refresh_result.get("fallback_access_only") and refresh_credential.get("access_token"):
+                    credential = {
+                        "access_token": refresh_credential["access_token"],
+                        "expiry": refresh_credential["expiry"],
+                    }
+                elif isinstance(refresh_result.get("token_doc"), dict):
+                    imported_token_doc = refresh_result["token_doc"]
+                else:
+                    raise Failure(502, "gemini_account_read_failed")
+            elif credential:
                 account = self.probe_imported_account(slot, proxy_url, credential)
                 if account["state"] == "reauth_required":
                     raise Failure(400, "gemini_oauth_import_rejected")
@@ -6997,9 +7233,11 @@ class Host:
                 "max_concurrency": max_concurrency,
                 "auth_method": method,
                 "auth_state": (
-                    "authorized" if method == "api_key" or credential else "unverified"
+                    "authorized"
+                    if method == "api_key" or credential or imported_token_doc
+                    else "unverified"
                 ),
-                **({"oauth_imported": True} if credential else {}),
+                **({"oauth_imported": True} if credential and not imported_token_doc else {}),
                 **({"call_models": call_models} if call_models else {}),
                 "account": account,
                 "created_at": timestamp,
@@ -7008,10 +7246,22 @@ class Host:
             try:
                 if method == "api_key":
                     private_json(directory / "credential.json", {"api_key": api_key})
-                if credential:
+                if imported_token_doc:
+                    profile_id = self._write_imported_profile(
+                        directory,
+                        self.env_uid(env),
+                        imported_token_doc,
+                        project_id=account.get("project_id"),
+                    )
+                    env["profile"] = profile_id
+                elif credential:
                     private_json(directory / "oauth-import.json", credential)
                 self.environments[identifier] = env
                 self.save()
+                if imported_token_doc:
+                    self._remember_runtime_proxy(env, proxy_url)
+                    self._schedule_provision_locked(identifier, proxy_url)
+                    self._schedule_warm_locked(identifier)
             except OSError:
                 self.environments.pop(identifier, None)
                 shutil.rmtree(directory)
@@ -7531,6 +7781,7 @@ class Host:
         gateway_policy = body.get("gateway_policy")
         if not isinstance(gateway_policy, dict):
             gateway_policy = None
+        restart_resume = body.get("restart_resume") is True
         return {
             "identifier": identifier,
             "env": dict(env),
@@ -7543,6 +7794,7 @@ class Host:
             "infer_body": infer_body,
             "native_body": native_body,
             "gateway_policy": gateway_policy,
+            "restart_resume": restart_resume,
             "evidence": evidence,
             "entry": infer_entry,
         }
@@ -7825,12 +8077,17 @@ class Host:
 
             ctx["entry"]["cancel_fn"] = stop_shard_turn
             try:
+                shard_kwargs = {
+                    "model": ctx["model"],
+                    "gateway_policy": gateway_policy,
+                }
+                if ctx.get("restart_resume") is True:
+                    shard_kwargs["restart_resume"] = True
                 conn, response = shard.open_stream(
                     identifier,
                     ctx["request_id"],
                     ctx["native_body"],
-                    model=ctx["model"],
-                    gateway_policy=gateway_policy,
+                    **shard_kwargs,
                 )
                 if shard_id:
                     with self.lock:
@@ -7914,11 +8171,16 @@ class Host:
 
         ctx["entry"]["cancel_fn"] = stop_native
         try:
+            session_kwargs = {
+                "model": ctx["model"],
+                "gateway_policy": gateway_policy,
+            }
+            if ctx.get("restart_resume") is True:
+                session_kwargs["restart_resume"] = True
             conn, response = session.open_stream(
                 ctx["request_id"],
                 ctx["native_body"],
-                model=ctx["model"],
-                gateway_policy=gateway_policy,
+                **session_kwargs,
             )
             handler.begin_sse()
             while not cancel_event.is_set():
@@ -7930,6 +8192,11 @@ class Host:
                 had_error = True
                 return "cancelled", "gemini_inference_cancelled"
             session.last_used = time.monotonic()
+            if (
+                session.native_diagnostic is not None
+                and hasattr(session.native_diagnostic, "clear_advisory")
+            ):
+                session.native_diagnostic.clear_advisory()
             return "completed", None
         except native_mod.NativeFailure as error:
             had_error = error.code != "gemini_unsupported_turn"
@@ -7942,6 +8209,7 @@ class Host:
             if code in (
                 "gemini_location_unsupported",
                 "gemini_account_verification_required",
+                "gemini_client_unsupported",
                 "gemini_account_ineligible",
             ):
                 status = 403
@@ -8093,6 +8361,7 @@ class ControlHandler(BaseHTTPRequestHandler):
                 "terminal-io",
                 "terminal-stop",
                 "install-payload",
+                "ensure-payload",
                 "maintenance-status",
                 "maintenance-quiesce",
                 "maintenance-sandbox",

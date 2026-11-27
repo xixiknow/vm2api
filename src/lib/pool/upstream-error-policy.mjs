@@ -1,4 +1,5 @@
 import { canRepairAdaptiveThinking, normalizeThinkingForModel } from '../protocol/thinking.mjs'
+import { removeCacheControlFields } from '../protocol/cache-ttl.mjs'
 import { flattenSearchResultHistory, rectifyUnofficialRequestForRetry } from '../protocol/request-rectifier.mjs'
 import {
   assistantStopReason,
@@ -71,6 +72,19 @@ const ORGANIZATION_DISABLED_PATTERNS = [
   /oauth authentication is currently not allowed/i,
   /organization.*(?:blocked|banned|disabled)/i,
 ]
+
+// Static Pydantic / request-schema validation 400s fail the same way on every
+// healthy slot and must not open the unit circuit breaker.
+const DETERMINISTIC_REQUEST_SCHEMA_400_PATTERNS = [
+  /\b(?:tools|messages|system)\.\d+[^:]*:\s*(?:extra inputs are not permitted|input tag\b.+\bdoes not match|field required|input should be|string should have|list should have)/i,
+  /\b(?:input_schema|tool_choice|output_config|thinking|max_tokens)\b[^:]*:\s*(?:extra inputs are not permitted|field required|input should be|greater than|less than)/i,
+]
+
+function isDeterministicRequestSchema400(message) {
+  const text = String(message || '')
+  if (!text) return false
+  return DETERMINISTIC_REQUEST_SCHEMA_400_PATTERNS.some((pattern) => pattern.test(text))
+}
 
 /**
  * The org refuses this seat. Shared by the runtime 400/401/403 classifier and
@@ -437,6 +451,15 @@ function classifyUpstreamResultRaw(
     }
   }
   if (result.cragPolicyBlock === true && !result.committed) {
+    if (result.cragCacheControlBlocked === true && !repaired) {
+      return {
+        scope: 'request',
+        action: 'repair-and-retry',
+        reason: 'cache_control_repairable',
+        cooldownUntil: null,
+        retrySameAccount: true,
+      }
+    }
     return {
       scope: 'request',
       action: 'stop',
@@ -735,6 +758,16 @@ function classifyUpstreamResultRaw(
         cooldownUntil: null,
       }
     }
+    // Deterministic Pydantic / request-schema validation 400s fail identically on
+    // every healthy slot, so they must not trip the unit circuit breaker.
+    if (isDeterministicRequestSchema400(message)) {
+      return {
+        scope: 'request',
+        action: 'stop',
+        reason: 'invalid_request_schema',
+        cooldownUntil: null,
+      }
+    }
     return { scope: 'request', action: 'stop', reason: 'invalid_request', cooldownUntil: null, circuit: true }
   }
   if (status === 401) return classifyOAuth401(hasRefresh, hay)
@@ -997,6 +1030,9 @@ export function repairAnthropicRequest(body = {}, policy = {}) {
   }
   if (reason === 'search_repairable') {
     return flattenSearchResultHistory(body)
+  }
+  if (reason === 'cache_control_repairable') {
+    return removeCacheControlFields(body)
   }
   if (reason === 'thinking_repairable') {
     const next = structuredClone(body)

@@ -39,6 +39,19 @@ LAUNCHER_EXIT = re.compile(
     rb"(craggemini|agy) (-?[0-9]{1,3})(?: ([a-z][a-z0-9_]{0,31}))?\n"
 )
 ELIGIBILITY_LOG_FILE = "cli-diagnostic"
+ADVISORY_DIAGNOSTIC_CODES = frozenset({"gemini_client_unsupported"})
+
+
+def poll_diagnostic(diagnostic, *, final=False, include_advisory=True):
+    if diagnostic is None:
+        return None
+    if not include_advisory:
+        try:
+            code = diagnostic.poll(final=final, include_advisory=False)
+        except TypeError:
+            code = diagnostic.poll(final=final)
+        return None if code in ADVISORY_DIAGNOSTIC_CODES else code
+    return diagnostic.poll(final=final)
 
 
 class EligibilityDiagnostic:
@@ -94,6 +107,13 @@ class EligibilityDiagnostic:
                             self.code = "gemini_account_verification_required"
                     elif re.fullmatch(
                         rb"W[0-9]{4} [0-9:. ]+ [0-9]+ server_oauth\.go:[0-9]+\] "
+                        rb"Account ineligible: [^\r\n]{0,256}(?:UNSUPPORTED_CLIENT|[Uu]nsupported client|client[^\r\n]{0,64}not supported)[^\r\n]{0,256}\r?\n",
+                        self.pending,
+                    ):
+                        with self._lock:
+                            self.code = "gemini_client_unsupported"
+                    elif re.fullmatch(
+                        rb"W[0-9]{4} [0-9:. ]+ [0-9]+ server_oauth\.go:[0-9]+\] "
                         rb"Account ineligible: [^\r\n]{1,512}\r?\n",
                         self.pending,
                     ):
@@ -131,7 +151,7 @@ class EligibilityDiagnostic:
             os.close(descriptor)
             self._snapshot_ready.set()
 
-    def poll(self, *, final=False):
+    def poll(self, *, final=False, include_advisory=True):
         with self._lock:
             code = self.code
         if final and code is None and self.descriptor is not None:
@@ -140,7 +160,15 @@ class EligibilityDiagnostic:
             self._snapshot_requested.set()
             self._snapshot_ready.wait(timeout=0.25)
         with self._lock:
-            return self.code
+            code = self.code
+        if not include_advisory and code in ADVISORY_DIAGNOSTIC_CODES:
+            return None
+        return code
+
+    def clear_advisory(self):
+        with self._lock:
+            if self.code in ADVISORY_DIAGNOSTIC_CODES:
+                self.code = None
 
     def close(self):
         if self.descriptor is None:
@@ -474,6 +502,8 @@ def _map_worker_error(http_status, payload):
         return NativeFailure("gemini_inference_timeout", 504, message)
     if code == "cancelled":
         return NativeFailure("gemini_inference_cancelled", 499, message)
+    if code in ("tool_continuation_aborted", "gemini_session_conflict"):
+        return NativeFailure("gemini_session_conflict", 409, message)
     if effective_status == 429:
         raw_retry = payload.get("retry_after_ms") if isinstance(payload, dict) else None
         retry_after_ms = (
@@ -501,6 +531,19 @@ def _map_worker_error(http_status, payload):
         return NativeFailure("gemini_location_unsupported", 403, message)
     if effective_status == 404:
         return NativeFailure("gemini_model_unavailable", 404, message)
+    if code == "upstream_unavailable" or effective_status == 503:
+        raw_retry = payload.get("retry_after_ms") if isinstance(payload, dict) else None
+        retry_after_ms = (
+            raw_retry
+            if type(raw_retry) is int and 1 <= raw_retry <= 3_600_000
+            else None
+        )
+        return NativeFailure(
+            "gemini_upstream_unavailable",
+            503,
+            message or "Gemini upstream service temporarily unavailable",
+            retry_after_ms=retry_after_ms,
+        )
     return NativeFailure("gemini_inference_failed", effective_status if 400 <= effective_status <= 599 else 502, message)
 
 
@@ -524,6 +567,7 @@ def open_worker_stream(
     startup_timeout=45,
     turn_timeout=TURN_TIMEOUT,
     gateway_policy=None,
+    restart_resume=False,
     diagnostic=None,
     account_id=None,
     is_alive=None,
@@ -550,15 +594,20 @@ def open_worker_stream(
     def _wait_worker_ready():
         start_deadline = time.monotonic() + startup_timeout
         while time.monotonic() < start_deadline:
-            if diagnostic is not None:
-                diag_code = diagnostic.poll()
-                if diag_code is not None:
-                    raise NativeFailure(diag_code, 403)
+            diag_code = poll_diagnostic(diagnostic, include_advisory=False)
+            if diag_code is not None:
+                raise NativeFailure(diag_code, 403)
             if exit_reader is not None:
                 outcome = exit_reader()
                 if outcome is not None:
+                    final_diag = poll_diagnostic(diagnostic, final=True, include_advisory=True)
+                    if final_diag is not None:
+                        raise NativeFailure(final_diag, 403)
                     raise launcher_exit_failure(outcome)
             if is_alive is not None and not is_alive():
+                final_diag = poll_diagnostic(diagnostic, final=True, include_advisory=True)
+                if final_diag is not None:
+                    raise NativeFailure(final_diag, 403)
                 outcome = exit_reader() if exit_reader is not None else None
                 if outcome is not None:
                     raise launcher_exit_failure(outcome)
@@ -573,6 +622,9 @@ def open_worker_stream(
             if _worker_ready(status):
                 return
             time.sleep(0.05)
+        final_diag = poll_diagnostic(diagnostic, final=True, include_advisory=True)
+        if final_diag is not None:
+            raise NativeFailure(final_diag, 403)
         raise NativeFailure("gemini_native_bridge_timeout", 503)
 
     wire_body = body_obj
@@ -586,6 +638,8 @@ def open_worker_stream(
         "stream": True,
         "body": wire_body,
     }
+    if restart_resume is True:
+        envelope["restart_resume"] = True
     if system_prompt_mode == "zero":
         envelope["system_prompt_mode"] = "zero"
     conv_id = wire_body.get("conversation_id") or wire_body.get("conversationId")
@@ -605,15 +659,20 @@ def open_worker_stream(
     if not skip_ready_probe:
         _wait_worker_ready()
     else:
-        if diagnostic is not None:
-            diag_code = diagnostic.poll()
-            if diag_code is not None:
-                raise NativeFailure(diag_code, 403)
+        diag_code = poll_diagnostic(diagnostic, include_advisory=False)
+        if diag_code is not None:
+            raise NativeFailure(diag_code, 403)
         if exit_reader is not None:
             outcome = exit_reader()
             if outcome is not None:
+                final_diag = poll_diagnostic(diagnostic, final=True, include_advisory=True)
+                if final_diag is not None:
+                    raise NativeFailure(final_diag, 403)
                 raise launcher_exit_failure(outcome)
         if is_alive is not None and not is_alive():
+            final_diag = poll_diagnostic(diagnostic, final=True, include_advisory=True)
+            if final_diag is not None:
+                raise NativeFailure(final_diag, 403)
             outcome = exit_reader() if exit_reader is not None else None
             if outcome is not None:
                 raise launcher_exit_failure(outcome)
@@ -623,10 +682,9 @@ def open_worker_stream(
     while True:
         connection = _UnixHTTPConnection(socket_path, turn_timeout)
         try:
-            if diagnostic is not None:
-                diag_code = diagnostic.poll()
-                if diag_code is not None:
-                    raise NativeFailure(diag_code, 403)
+            diag_code = poll_diagnostic(diagnostic, include_advisory=False)
+            if diag_code is not None:
+                raise NativeFailure(diag_code, 403)
             response = connection.request(
                 "POST",
                 message_path,
@@ -640,7 +698,7 @@ def open_worker_stream(
             if diagnostic is not None and connection.sock is not None:
                 header_deadline = time.monotonic() + turn_timeout
                 while time.monotonic() < header_deadline:
-                    diag_code = diagnostic.poll()
+                    diag_code = poll_diagnostic(diagnostic, include_advisory=False)
                     if diag_code is not None:
                         connection.close()
                         cancel_worker_request(

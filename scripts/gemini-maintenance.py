@@ -27,6 +27,21 @@ import tempfile
 import threading
 import time
 
+_SCRIPT_DIR = Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+
+from gemini_host_apparmor import (
+    APPARMOR_MARKER,
+    APPARMOR_PROFILE_NAME,
+    GEMINI_BWRAP_ENTRY,
+    apparmor_profile_bytes,
+    bwrap_userns_mediated,
+    install_managed_bwrap,
+    managed_bwrap_entry_configured,
+    managed_bwrap_required,
+)
+
 
 SOCKET = Path("/run/vm2api-gemini-maintenance/control.sock")
 ACTIONS = {
@@ -61,6 +76,7 @@ RUNTIME_FILES = (
     "scripts/install-gemini-payload.mjs",
     "src/lib/gemini/payload.mjs",
     "bin/kin-egress",
+    "scripts/gemini_host_apparmor.py",
 )
 VERIFIER_FILES = RUNTIME_FILES[5:7]
 MEMBERS = ("manifest.json", "manifest.sig", "agy", "craggemini", "libagy_bridge.so")
@@ -80,15 +96,7 @@ CRAG_MEMBERS = (
 CRAG_ASSETS = tuple(name for name in CRAG_MEMBERS if name != "agy")
 SYSTEMD_UNIT = "vm2api-gemini.service"
 APPARMOR_SERVICE = "apparmor.service"
-APPARMOR_PROFILE_NAME = "vm2api-gemini"
-APPARMOR_MARKER = "# Managed by vm2api Gemini host userns preparation."
-APPARMOR_PROFILE_CONTENT = (
-    APPARMOR_MARKER
-    + "\nabi <abi/4.0>,\n"
-    + f"profile {APPARMOR_PROFILE_NAME} flags=(unconfined) {{\n"
-    + "  userns,\n"
-    + "}\n"
-).encode("ascii")
+APPARMOR_PROFILE_CONTENT = apparmor_profile_bytes()
 SANDBOX_ERROR_CODES = frozenset(
     {
         "gemini_sandbox_apparmor_restricted",
@@ -1279,11 +1287,18 @@ class Maintenance:
             lines = existing.splitlines()
             if not lines or lines[0] != APPARMOR_MARKER.encode("ascii"):
                 raise fail("apparmor_policy_conflict")
+        bwrap_entry = None
+        if bwrap_userns_mediated(host_root=self._host_path("/")):
+            try:
+                bwrap_entry = install_managed_bwrap(host_root=self._host_path("/"))
+            except (OSError, FileNotFoundError) as err:
+                raise fail("apparmor_unavailable") from err
+        profile_content = apparmor_profile_bytes(bwrap_entry=bwrap_entry)
         fd, tmp_name = tempfile.mkstemp(prefix=".vm2api-gemini.", dir=profile_dir)
         tmp_path = Path(tmp_name)
         try:
             with os.fdopen(fd, "wb") as output:
-                output.write(APPARMOR_PROFILE_CONTENT)
+                output.write(profile_content)
                 os.fchmod(output.fileno(), 0o644)
                 output.flush()
                 os.fsync(output.fileno())
@@ -1340,16 +1355,18 @@ class Maintenance:
             client.close()
 
     def inspect_static_sandbox(self, service_info=None):
-        has_tools = all(
-            shutil.which(tool, path=SYSTEM_ENV["PATH"])
-            for tool in ("setpriv", "bwrap")
+        has_setpriv = bool(shutil.which("setpriv", path=SYSTEM_ENV["PATH"]))
+        has_bwrap = bool(shutil.which("bwrap", path=SYSTEM_ENV["PATH"])) or (
+            self._host_path(GEMINI_BWRAP_ENTRY).is_file()
         )
         if self.apparmor_userns_restricted():
             loaded = self.apparmor_profile_loaded()
             unit_profile = (service_info or {}).get("AppArmorProfile", "").strip()
             if not (loaded and unit_profile == APPARMOR_PROFILE_NAME):
                 return ("fail", "gemini_sandbox_apparmor_restricted")
-        if not has_tools:
+            if not managed_bwrap_entry_configured(host_root=self._host_path("/")):
+                return ("fail", "gemini_sandbox_apparmor_restricted")
+        if not (has_setpriv and has_bwrap):
             return ("warning", "gemini_sandbox_unavailable")
         return ("pass", None)
 
@@ -1751,6 +1768,19 @@ class Maintenance:
             except (Failure, OSError, ValueError, RecursionError):
                 pass
 
+    def is_default_crag_public_key(self, key_path):
+        if not self.crag_bundle or key_path is None:
+            return False
+        if (
+            (self.runtime / "defaults") in key_path.parents
+            and key_path.name == "crag-license-public.pem"
+        ):
+            return True
+        try:
+            return hash_pin(key_path, self.pins["crag-license-public.pem"])
+        except (OSError, ValueError):
+            return False
+
     def stage_pinned(self):
         if sys.platform != "linux" or platform.machine() not in {"x86_64", "amd64"}:
             raise fail("unsupported_host")
@@ -1763,19 +1793,22 @@ class Maintenance:
             *(self.bundle / name for name in VERIFIER_FILES),
         ):
             require_root(entry, stat.S_ISREG)
-        command(
-            [
-                "/usr/bin/python3",
-                "-I",
-                str(fetcher),
-                "--manifest",
-                str(self.descriptor),
-                "--dest",
-                str(source),
-            ],
-            600,
-            "fetch_failed",
-        )
+        argv = [
+            "/usr/bin/python3",
+            "-I",
+            str(fetcher),
+            "--manifest",
+            str(self.descriptor),
+            "--dest",
+            str(source),
+        ]
+        existing_agy = self.current / "agy"
+        try:
+            require_root(existing_agy, stat.S_ISREG)
+            argv.extend(["--reuse-agy", str(existing_agy)])
+        except (OSError, ValueError):
+            pass
+        command(argv, 600, "fetch_failed")
         self.phase("verifying")
         expected_assets = CRAG_ASSETS if self.crag_bundle else ASSETS
         if not all(hash_pin(source / name, self.pins[name]) for name in expected_assets):
@@ -2118,15 +2151,20 @@ class Maintenance:
                     verifier_root = candidate["verifier_root"]
                     materialized = True
                 if not materialized:
+                    configured_key = (
+                        Path(options["--public-key"]) if before is not None else None
+                    )
                     manual_trust_configured = (
                         "--release-verifier" in options
                         or exists(self.manual_release)
                         or (
-                            before is not None
-                            and Path(options["--public-key"]) != self.public_key
+                            configured_key is not None
+                            and configured_key != self.public_key
+                            and not self.is_default_crag_public_key(configured_key)
                         )
                         or (
-                            "--default-release-verifier" not in options
+                            not self.crag_bundle
+                            and "--default-release-verifier" not in options
                             and exists(self.public_key)
                         )
                     )
@@ -2135,11 +2173,11 @@ class Maintenance:
                     ):
                         # When current payload failed verification under standard default trust
                         # (e.g. corrupted manifest.json or mismatched old release digest), allow
-                        # repair/recover to replace it with a freshly verified signed release
+                        # install/repair/recover to replace it with a freshly verified signed release
                         # instead of deadlocking between update_requires_valid_payload and
                         # repair_release_unknown. Manual trust configurations still fail closed.
                         can_reinstall_broken = (
-                            action in {"repair", "recover"}
+                            action in {"install", "repair", "recover"}
                             and not manual_trust_configured
                             and (self.crag_bundle or target["pinned"])
                         )

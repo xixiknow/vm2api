@@ -12,7 +12,7 @@
 import { getDb } from '../database.mjs'
 import { DEFAULT_MUTED_ERROR_CLASSES, enrichLogRow, excludeErrorClassSql } from '../../admin/error-class.mjs'
 import { reportTimezone, zonedDayStartMs } from '../../core/timezone.mjs'
-import { modelMismatch } from '../../protocol/log-fields.mjs'
+import { THIRD_PARTY_CLIENT_SESSION_ID, modelMismatch } from '../../protocol/log-fields.mjs'
 import {
   ERROR_PRED,
   PROMPT_TOKENS_SQL,
@@ -31,8 +31,8 @@ const SCAN_CAP = 2000
 const SUMMARY_SCAN_CAP = 5000
 /** Recent rows mined for distinct filter values / empty-prefix session suggestions. */
 const RECENT_SCAN = 5000
-/** One conversation = the caller's session id; rows without one fall back to the outbound id. */
-const CONVERSATION_KEY_SQL = "COALESCE(NULLIF(session_id, ''), outbound_session_id)"
+/** One conversation = the caller's session id; rows without one (or tagged as third-party) fall back to the outbound id. */
+const CONVERSATION_KEY_SQL = `COALESCE(NULLIF(NULLIF(session_id, ''), '${THIRD_PARTY_CLIENT_SESSION_ID}'), outbound_session_id)`
 const OPTION_LIMIT = 200
 const EXPORT_LIMIT_DEFAULT = 2000
 const EXPORT_LIMIT_MAX = 5000
@@ -46,6 +46,7 @@ const BLOCKED_STATES = {
   refusal_guard: 'refusal_guard',
   refusal_similar: 'refusal_guard',
   refusal_device: 'refusal_guard',
+  refusal_session: 'refusal_guard',
   policy_blocked: 'policy',
 }
 
@@ -245,6 +246,7 @@ export function toUsageLogRow(row, names, chain = []) {
     inboundDeviceId: row.inbound_device_id ?? null,
     upstreamStatus: nullableNum(row.upstream_status),
     upstream400Message: row.upstream_400_message ?? null,
+    intercept: parseErrorDetails(row.intercept),
     jevState: row.jev_state || null,
     errorClass: row.error_class ?? null,
     errorLabel: row.error_label ?? null,
@@ -360,7 +362,10 @@ function buildFilter(filters, defaultMuted) {
   }
   eq('path', filters.endpoint)
   eq('protocol', filters.protocol)
-  if (filters.upstream_400) where.push('upstream_status = 400')
+  eq('via', filters.via)
+  eq('final_state', filters.final_state)
+  if (filters.upstream_risk_errors) where.push('upstream_status IN (400, 401, 403, 422)')
+  else if (filters.upstream_400) where.push('upstream_status = 400')
   eq('request_id', filters.request_id)
   if (filters.account_id) {
     where.push('(account_id = ? OR final_account_id = ?)')

@@ -29,6 +29,7 @@ const localFilesystems = new Set([0xef53, 0x794c7630, 0x58465342, 0x9123683e, 0x
 const MAX_DEFERRED_RELEASES = 10000
 const MAX_DEFERRED_RELEASE_BYTES = 4 * 1024 * 1024
 const MAX_REDEEM_INTENT_BYTES = 1024
+const ENABLED_PROBE_CONCURRENCY = 8
 const terminalRedeem = new Map([
   ['redeem_unavailable', 404],
   ['host_redeem_conflict', 409],
@@ -1239,6 +1240,29 @@ export function createCragSubscription({
     return second === EXCLUSIVE_BUSY ? usageUnverified(retryable) : second
   }
 
+  /** Each check runs Docker probes against one slot. In series they add up to
+   * tens of seconds on a host with dozens of CRAG slots, so run a bounded number
+   * at once. Any probe failure still fails the whole count. */
+  async function countEnabledSlots(vms, opts) {
+    let next = 0
+    let enabled = 0
+    let failed = false
+    const worker = async () => {
+      while (!failed && next < vms.length) {
+        const vm = vms[next++]
+        try {
+          if (await isSlotEnabled(vm, opts)) enabled += 1
+        } catch (error) {
+          // The count is void now; do not keep probing the remaining slots.
+          failed = true
+          throw error
+        }
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(ENABLED_PROBE_CONCURRENCY, vms.length) }, worker))
+    return enabled
+  }
+
   async function status(confirmed, mayRetry = true) {
     let targets
     let inventory = {}
@@ -1332,6 +1356,9 @@ export function createCragSubscription({
                   publish(hostFile, hostId, 0o644, true)
                 }
                 publish(entitlementFile, next.code, 0o644)
+                // Immediately bind our random local credential on the Authority to replace the
+                // temporary direct-credit placeholder so sensitive routes stay authenticated.
+                await recoverCredential(hostId).catch(() => {})
                 if (mayRetry) return status(next, false)
               }
             }
@@ -1349,11 +1376,9 @@ export function createCragSubscription({
         targetReady = !!targets && !pending && (await ready({ allowPrepared: true }, targets))
         if (targets && claims?.version === 1 && !pending) upgrade_available = await ready({ reclaim: true }, targets)
         if (targets && isSlotEnabled && (claims || isSubscriptionSlot)) {
-          let enabled = 0
-          for (const vm of claims && !pending ? targets : []) {
-            if (await isSlotEnabled(vm, { reclaim: claims.version === 2 })) enabled += 1
-          }
-          enabled_slots = enabled
+          enabled_slots = await countEnabledSlots(claims && !pending ? targets : [], {
+            reclaim: claims?.version === 2,
+          })
         }
       } catch {
         target_probe_failed = true
@@ -2500,20 +2525,56 @@ export function createCragSubscription({
         offset: Number.isSafeInteger(data.offset) ? data.offset : safeOffset,
       }
     },
-    migrate(fromHostInput) {
+    migrate(fromHostInput, proofInput) {
       return exclusive(
         async () => {
           const trimmed = typeof fromHostInput === 'string' ? fromHostInput.trim().toLowerCase() : ''
           const fromHostId = isDigest(trimmed) ? trimmed : uuidToHostId(trimmed)
           if (!fromHostId) throw fail('crag_subscription_invalid_request', 400)
+          const proofObj =
+            typeof proofInput === 'string'
+              ? { proof: proofInput }
+              : proofInput && typeof proofInput === 'object'
+                ? proofInput
+                : {}
+          const proofBody = {}
+          if (typeof proofObj.proof === 'string' && proofObj.proof.trim()) {
+            const p = proofObj.proof.trim()
+            if (p.startsWith('CRAGR1.')) {
+              proofBody.proof_redemption_code = p
+            } else if (/^[0-9a-zA-Z_-]{1,64}$/.test(p)) {
+              proofBody.proof_order_id = p
+            } else {
+              throw fail('crag_subscription_invalid_request', 400)
+            }
+          }
+          if (typeof proofObj.proof_order_id === 'string' && proofObj.proof_order_id.trim()) {
+            const oid = proofObj.proof_order_id.trim()
+            if (!/^[0-9a-zA-Z_-]{1,64}$/.test(oid)) throw fail('crag_subscription_invalid_request', 400)
+            proofBody.proof_order_id = oid
+          }
+          if (typeof proofObj.proof_redemption_code === 'string' && proofObj.proof_redemption_code.trim()) {
+            const code = proofObj.proof_redemption_code.trim()
+            if (!code.startsWith('CRAGR1.')) throw fail('crag_subscription_invalid_request', 400)
+            proofBody.proof_redemption_code = code
+          }
+          if (Object.keys(proofBody).length === 0) {
+            throw fail('crag_subscription_invalid_request', 400)
+          }
           const hostId = identity()
           if (fromHostId === hostId) throw fail('crag_subscription_invalid_request', 400)
           checkNoIntent()
           storage(true)
           const previous = current(hostId)
-          const data = await authority('migrate', hostId, optionalCredential(hostId), {
+          // Ensure the destination host presents a real local credential so the Authority
+          // binds it atomically when creating the migrated host record.
+          const destKey =
+            optionalCredential(hostId) ??
+            (!load(hostFile, 0o644, 64) && !load(keyFile, 0o600, 43) ? credential(hostId, true) : undefined)
+          const data = await authority('migrate', hostId, destKey, {
             from_host_id: fromHostId,
             to_host_id: hostId,
+            ...proofBody,
           })
           let confirmed
           if (data?.rights?.entitlement) {

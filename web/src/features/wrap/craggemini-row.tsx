@@ -31,6 +31,7 @@ import { geminiInventoryOptions } from '@/features/import/gemini-environments'
 import {
   compareGeminiVersions,
   GEMINI_INSTALL_COMMAND,
+  geminiMaintenanceCodeLabel,
   geminiMaintenanceErrorMessage,
   geminiPayloadLabels,
   geminiPhaseLabels,
@@ -234,6 +235,15 @@ export function CragGeminiKernelRow({
     Boolean(geminiPin?.tag) &&
     bundledReleases[0]?.id !== geminiPin?.tag
 
+  const refetchMaintenance = maintenance.refetch
+  const maintenanceIdleWithoutData =
+    canEdit && maintenance.isPending && maintenance.fetchStatus === 'idle'
+  useEffect(() => {
+    // A cancelled first read (e.g. cancelQueries with revert) leaves the query
+    // pending but idle, and nothing would ever fetch it again.
+    if (maintenanceIdleWithoutData) void refetchMaintenance()
+  }, [maintenanceIdleWithoutData, refetchMaintenance])
+
   useEffect(() => {
     if (!jobId || (jobStatus !== 'completed' && jobStatus !== 'failed')) return
     void qc.invalidateQueries?.({
@@ -346,6 +356,24 @@ export function CragGeminiKernelRow({
     }
   }
 
+  const statusErrorCode = isApiError(maintenance.error)
+    ? maintenance.error.code
+    : ''
+  const retryStatusButton = (
+    <Button
+      type='button'
+      size='sm'
+      variant='ghost'
+      className='h-7 px-2'
+      aria-label='重新读取 CRAGGemini 宿主状态'
+      disabled={maintenance.isFetching}
+      onClick={() => void refetchMaintenance()}
+    >
+      <RefreshCw aria-hidden='true' />
+      重试
+    </Button>
+  )
+
   const invData = inventory.data?.available ? inventory.data : undefined
   const sub = invData?.crag_subscription
   const envCount = invData?.environments.length ?? 0
@@ -382,23 +410,33 @@ export function CragGeminiKernelRow({
             <span className='text-muted-foreground'>
               仅管理员可查看或管理 CRAGGemini 宿主内核
             </span>
-          ) : maintenance.isPending ? (
-            <span className='inline-flex items-center gap-1.5 text-muted-foreground'>
-              <Loader2 aria-hidden='true' className='size-4 animate-spin' />
-              正在读取宿主状态…
-            </span>
-          ) : maintenance.isError ? (
-            <span className='inline-flex items-center gap-1.5 text-destructive'>
-              <TriangleAlert aria-hidden='true' className='size-4' />
-              无法读取 CRAGGemini 维护状态
-            </span>
           ) : unavailable ? (
             <span className='inline-flex items-center gap-1.5 text-muted-foreground'>
               <TriangleAlert aria-hidden='true' className='size-4' />
               {unavailable.bootstrap_required
-                ? '需要宿主机初始化'
-                : `维护服务不可用（${unavailable.code}）`}
+                ? '宿主维护未就绪，需先初始化'
+                : (geminiMaintenanceCodeLabel(unavailable.code) ??
+                  `维护服务不可用（${unavailable.code}）`)}
             </span>
+          ) : maintenance.isError ? (
+            <span className='inline-flex flex-wrap items-center gap-1.5 text-destructive'>
+              <TriangleAlert aria-hidden='true' className='size-4' />
+              无法读取 CRAGGemini 维护状态
+              {statusErrorCode ? `（${statusErrorCode}）` : ''}
+              {retryStatusButton}
+            </span>
+          ) : maintenance.isPending ? (
+            maintenanceIdleWithoutData ? (
+              <span className='inline-flex items-center gap-1.5 text-muted-foreground'>
+                宿主状态尚未读取
+                {retryStatusButton}
+              </span>
+            ) : (
+              <span className='inline-flex items-center gap-1.5 text-muted-foreground'>
+                <Loader2 aria-hidden='true' className='size-4 animate-spin' />
+                正在读取宿主状态…
+              </span>
+            )
           ) : snapshot && payload ? (
             <>
               <span
